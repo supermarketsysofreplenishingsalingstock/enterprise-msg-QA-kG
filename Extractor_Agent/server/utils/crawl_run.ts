@@ -228,5 +228,87 @@ export async function executeExtractRun(params: ExecuteExtractParams) {
 
   runLightweightCuratorOnCrawlEnd()
 
+  // ── 公司爬取：自动推送知识库 ingest（LLM Wiki + DynamicLLMPathExtractor 图谱一体完成）──
+  if (env.kbAutoIngest && ['ok', 'partial_ok'].includes(status) && (options as any).__companyCrawl === true) {
+    const companyName = String((options as any).__companyName ?? '').trim()
+    if (!companyName) {
+      withMeta.meta = { ...withMeta.meta, kb_ingest: { ok: false, error: 'missing company name' } }
+    } else {
+      try {
+        const kbUrl = env.kbServiceUrl.replace(/\/$/, '')
+        const kbPayload = {
+          company: companyName,
+          crawl_time: new Date().toISOString().slice(0, 19).replace('T', ' '),
+          note: String(withMeta.task ?? '').slice(0, 200),
+          pages: Array.isArray(withMeta.kbPages) ? withMeta.kbPages : [],
+          files: (Array.isArray(withMeta.attachments) ? withMeta.attachments : [])
+            .filter((f: any) => f?.ok && f?.path)
+            .map((f: any) => ({
+              url: f.url,
+              title: f.filename,
+              path: f.path,
+              content_type: f.contentType,
+              size: f.size,
+            })),
+        }
+        emit?.({
+          type: 'log',
+          payload: {
+            level: 'info',
+            message: `知识库：推送「${companyName}」爬取内容到 ${kbUrl}（页面 ${kbPayload.pages.length} / 文件 ${kbPayload.files.length}）`,
+            ts: Date.now(),
+          },
+        })
+        const kbResp = await fetch(`${kbUrl}/api/ingest`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(kbPayload),
+          signal: AbortSignal.timeout(900_000),
+        })
+        const kbRes: any = await kbResp.json().catch(() => null)
+        if (kbResp.ok && kbRes?.ok) {
+          withMeta.meta = {
+            ...withMeta.meta,
+            kb_ingest: {
+              ok: true,
+              snapshot_id: kbRes.snapshot_id,
+              triplets: kbRes.triplet_count,
+              wiki_pages: kbRes.wiki_pages_updated,
+              graph_ui: `${kbUrl}/`,
+            },
+          }
+          emit?.({
+            type: 'log',
+            payload: {
+              level: 'info',
+              message: `知识库：ingest 完成（快照 ${kbRes.snapshot_id}，三元组 ${kbRes.triplet_count}，实体页 ${kbRes.wiki_pages_updated}）；图谱界面 ${kbUrl}/`,
+              ts: Date.now(),
+            },
+          })
+        } else {
+          withMeta.meta = {
+            ...withMeta.meta,
+            kb_ingest: { ok: false, error: String(kbRes?.detail ?? kbResp.statusText).slice(0, 240) },
+          }
+        }
+        setRunMeta(withMeta.meta)
+      } catch (e: any) {
+        withMeta.meta = {
+          ...withMeta.meta,
+          kb_ingest: { ok: false, error: String(e?.message ?? e).slice(0, 240) },
+        }
+        setRunMeta(withMeta.meta)
+        emit?.({
+          type: 'log',
+          payload: {
+            level: 'warn',
+            message: `知识库：ingest 失败（${String(e?.message ?? e).slice(0, 160)}）。请确认 wiki_kb_service 已启动。`,
+            ts: Date.now(),
+          },
+        })
+      }
+    }
+  }
+
   return withMeta
 }

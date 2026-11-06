@@ -22,7 +22,8 @@ import {
 } from './fetch/runtime'
 import { buildSeedFirstPlan, applyCrawlIntent, detectCrawlIntent } from '../services/crawlerAgentFrontload'
 import { uniqByUrl, extractDoubanTop250ListPage, extractJdPhbListPage, extractGenericListPage } from './extract/generic'
-import { extractSiteLinks, rankSiteLinks } from './extract/siteLinks'
+import { extractSiteLinks, rankSiteLinks, extractAttachmentLinks } from './extract/siteLinks'
+import { downloadAttachment, extractPageText } from './fetch/fileDownload'
 import { type StructuredTaskPlan } from '../services/crawlerAgentTaskPlanning'
 import { formatItemsByOutputSpec } from './verify/qualityGate'
 import { runVerifierRetries } from './verify/postRun'
@@ -585,6 +586,63 @@ export async function runCrawlerWorkflow(params: {
           memory.queue.push(nextUrl)
         }
 
+        // ── 公司爬取：页面正文 + 挂载文件附件（供知识库 ingest 与文件下载功能）──
+        try {
+          const pageUrlKb = String(snapshot.finalUrl || url)
+          const pageText = extractPageText(snapshot.html, 8000)
+          if (pageText) {
+            const kbPages: any[] = ((state.options as any).__kbPages ??= [])
+            kbPages.push({ url: pageUrlKb, title: String(snapshot.title || pageUrlKb), text: pageText })
+          }
+        } catch {}
+        const collectAttachments = (state.options as any)?.collectAttachments === true
+        if (collectAttachments) {
+          try {
+            const pageUrlAtt = String(snapshot.finalUrl || url)
+            const attachDir = path.join(
+              process.cwd(),
+              '.data',
+              'attachments',
+              String((state.options as any).__attachmentRunId ?? Date.now().toString(36)),
+            )
+            if (!(state.options as any).__attachmentRunId) {
+              ;(state.options as any).__attachmentRunId = Date.now().toString(36)
+              ;(state.options as any).__attachmentDir = attachDir
+            }
+            const seenUrls: Set<string> = ((state.options as any).__attachmentSeenUrls ??= new Set())
+            const budget: any[] = ((state.options as any).__attachments ??= [])
+            const maxAttachments = Math.max(0, Number((state.options as any).attachmentMax ?? 20) || 20)
+            const atts = extractAttachmentLinks(snapshot.html, pageUrlAtt, { max: 12 })
+            let downloadedHere = 0
+            for (const a of atts) {
+              if (budget.length >= maxAttachments) break
+              if (seenUrls.has(a.url)) continue
+              seenUrls.add(a.url)
+              const f = await downloadAttachment(
+                a.url,
+                params.config,
+                params.signal,
+                (state.options as any).__attachmentDir ?? attachDir,
+                a.filename,
+                a.ext,
+                budget.length + 1,
+              )
+              if (f.ok) {
+                budget.push(f)
+                downloadedHere += 1
+              }
+            }
+            if (downloadedHere > 0) {
+              params.emitLog(
+                'info',
+                `公司爬取：本页下载挂载文件 ${downloadedHere} 个（累计 ${budget.length}）`,
+              )
+            }
+          } catch (e: any) {
+            params.emitLog('warn', `公司爬取：附件收集失败：${String(e?.message ?? e).slice(0, 120)}`)
+          }
+        }
+
         // 整站爬取：从当前页发现站内链接，按深度入队（BFS）
         if (siteCrawl && crawlHosts.length > 0) {
           const currentDepth = Number(depthMap[url] ?? 0)
@@ -885,6 +943,12 @@ export async function runCrawlerWorkflow(params: {
         : [],
     },
     items: cappedItems,
+    attachments: Array.isArray((mergedOptions as any).__attachments)
+      ? (mergedOptions as any).__attachments
+      : [],
+    kbPages: Array.isArray((mergedOptions as any).__kbPages)
+      ? (mergedOptions as any).__kbPages.slice(0, 60)
+      : [],
     output: { format: params.taskPlan.outputSpec.format, content: formattedOutput },
     quality: evalResult.quality,
     status: evalResult.status,

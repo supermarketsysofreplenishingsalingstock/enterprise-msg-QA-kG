@@ -113,5 +113,57 @@ export function rankSiteLinks(links: string[]): string[] {
       return 1_000_000
     }
   }
-  return [...links].sort((a, b) => score(a) - score(b))
+  return [...links].sort((a: string, b: string) => score(a) - score(b))
+}
+
+/** ── 公司爬取：页面上挂载的文件（附件）收集 ──
+ * 公司官网常见挂载文件：pdf / doc(x) / xls(x) / ppt(x) / zip / txt / csv 等。
+ */
+const ATTACH_EXT =
+  /\.(?:pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|md|wps|et|dps|ofd)$/i
+
+export type AttachmentLink = { url: string; filename: string; ext: string }
+
+/** 从 HTML 中收集挂载文件链接（含 <a href> 与 <iframe src>，去重、规范化） */
+export function extractAttachmentLinks(html: string, baseUrl: string, opts: { max?: number } = {}): AttachmentLink[] {
+  const max = Math.max(1, Math.min(50, Math.floor(Number(opts.max ?? 12) || 12)))
+  const base = (() => {
+    try {
+      return new URL(baseUrl)
+    } catch {
+      return null
+    }
+  })()
+  if (!base || !html) return []
+
+  const $ = load(html)
+  const seen = new Set<string>()
+  const out: AttachmentLink[] = []
+
+  const push = (raw: string, hintTitle?: string) => {
+    if (out.length >= max) return
+    const hrefRaw = String(raw ?? '').trim()
+    if (!hrefRaw || /^(?:javascript:|mailto:|tel:|data:|sms:|ftp:|blob:)/i.test(hrefRaw)) return
+    const u = resolveLink(hrefRaw, base.toString())
+    if (!u) return
+    const pathname = u.pathname
+    if (!ATTACH_EXT.test(pathname)) return
+    const key = u.toString()
+    if (seen.has(key)) return
+    seen.add(key)
+    const m = pathname.match(/([^/]+)$/)
+    const filename = decodeURIComponent((m?.[1] ?? 'attachment').slice(0, 120))
+    out.push({ url: key, filename, ext: (pathname.match(ATTACH_EXT)?.[1] ?? '').toLowerCase() })
+    void hintTitle
+  }
+
+  $('a[href]').each((_, el) => {
+    const label = String($(el).attr('title') ?? $(el).text() ?? '').trim().slice(0, 80)
+    push(String($(el).attr('href') ?? ''), label)
+  })
+  $('iframe[src]').each((_, el) => {
+    push(String($(el).attr('src') ?? ''))
+  })
+
+  return out
 }

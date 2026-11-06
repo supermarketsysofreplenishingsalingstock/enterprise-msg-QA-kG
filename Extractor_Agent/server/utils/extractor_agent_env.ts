@@ -73,6 +73,12 @@ export const EXTRACTOR_AGENT_DEFAULTS = {
   queueMaxConcurrent: 3,
   /** 单次任务云抓取（MCP）最大调用次数，与 seed 队列上限对齐 */
   mcpMaxCallsDefault: 6,
+  /** 公司爬取：知识库服务地址（LLM Wiki + 图谱） */
+  kbServiceUrl: 'http://127.0.0.1:13105',
+  /** 公司爬取完成后自动推送知识库 ingest */
+  kbAutoIngest: true,
+  /** 单次任务附件下载上限 */
+  attachmentMaxDefault: 20,
 } as const
 
 export type ExtractorAgentEnv = {
@@ -121,6 +127,9 @@ export type ExtractorAgentEnv = {
   redisUrl: string
   queueMaxConcurrent: number
   mcpMaxCallsDefault: number
+  kbServiceUrl: string
+  kbAutoIngest: boolean
+  attachmentMaxDefault: number
 }
 
 let cached: { at: number; env: ExtractorAgentEnv } | null = null
@@ -187,6 +196,9 @@ export function getExtractorAgentEnv(): ExtractorAgentEnv {
       20,
     ),
     mcpMaxCallsDefault: parseEnvInt('EXTRACTOR_MCP_MAX_CALLS', d.mcpMaxCallsDefault, 0, 24),
+    kbServiceUrl: String(process.env.KB_SERVICE_URL || d.kbServiceUrl).trim() || d.kbServiceUrl,
+    kbAutoIngest: parseEnvBool('KB_AUTO_INGEST', d.kbAutoIngest),
+    attachmentMaxDefault: parseEnvInt('COMPANY_ATTACH_MAX', d.attachmentMaxDefault, 0, 100),
   }
   cached = { at: now, env }
   return env

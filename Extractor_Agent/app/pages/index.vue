@@ -121,6 +121,74 @@
           />
         </details>
 
+        <div class="form-group company-panel">
+          <div class="label-row">
+            <label>公司爬取（官网 → 挂载文件 → 知识库）</label>
+            <button
+              type="button"
+              class="network-toggle"
+              :disabled="companySearching || status === 'running'"
+              @click="searchCompanySites"
+            >
+              {{ companySearching ? '搜索中…' : '搜索官网候选' }}
+            </button>
+          </div>
+          <div class="company-inputs">
+            <input
+              v-model="companyName"
+              class="input-field company-input"
+              placeholder="公司名称，如：XX科技有限公司"
+            />
+            <input
+              v-model="companyTraits"
+              class="input-field company-traits"
+              placeholder="条件特征（选填，逗号分隔：行业、地区、关键词…用于更准地定位官网）"
+            />
+          </div>
+          <div class="company-options">
+            <label class="company-check">
+              <input v-model="collectAttachments" type="checkbox" />
+              下载站内挂载文件（PDF / DOCX / XLSX 等）
+            </label>
+            <button type="button" class="btn btn-secondary btn-small" @click="openKbUi">
+              知识库 / 图谱界面
+            </button>
+          </div>
+          <div v-if="companyCandidates.length" class="candidate-list">
+            <div class="candidate-tip">{{ companySearchMessage || '请选择要爬取的网站（可多选）' }}</div>
+            <div v-for="(c, i) in companyCandidates" :key="i" class="candidate-row">
+              <input
+                :id="`cand_${i}`"
+                v-model="selectedCandidateUrls"
+                type="checkbox"
+                :value="c.url"
+              />
+              <label :for="`cand_${i}`">
+                <span class="cand-title">{{ c.title }}</span>
+                <span class="cand-host">{{ c.host }}</span>
+                <span v-if="c.excerpt" class="cand-excerpt">{{ c.excerpt }}</span>
+              </label>
+            </div>
+            <div class="candidate-actions">
+              <button
+                class="btn btn-primary btn-small"
+                :disabled="status === 'running' || !selectedCandidateUrls.length"
+                @click="startCompanyCrawl(false)"
+              >
+                爬取选中站点（{{ selectedCandidateUrls.length }}）
+              </button>
+              <button
+                class="btn btn-secondary btn-small"
+                :disabled="status === 'running' || !companyCandidates.length"
+                @click="startCompanyCrawl(true)"
+              >
+                全部爬取（{{ companyCandidates.length }}）
+              </button>
+              <button class="btn btn-secondary btn-small" @click="clearCandidates">清除</button>
+            </div>
+          </div>
+        </div>
+
         <div class="action-bar">
           <div class="button-group">
             <button :disabled="status === 'running'" @click="start" class="btn btn-primary">
@@ -242,6 +310,38 @@
                   {{ chip }}
                 </button>
               </div>
+              <div v-if="isCompanyCandidatesClarify" class="candidate-list">
+                <div class="candidate-tip">{{ companyClarifyQuestion }}</div>
+                <div v-for="(c, i) in companyCandidates" :key="`cl_${i}`" class="candidate-row">
+                  <input
+                    :id="`cl_cand_${i}`"
+                    v-model="selectedCandidateUrls"
+                    type="checkbox"
+                    :value="c.url"
+                  />
+                  <label :for="`cl_cand_${i}`">
+                    <span class="cand-title">{{ c.title }}</span>
+                    <span class="cand-host">{{ c.host }}</span>
+                  </label>
+                </div>
+                <div class="candidate-actions">
+                  <button
+                    class="btn btn-primary btn-small"
+                    :disabled="status === 'running' || !selectedCandidateUrls.length"
+                    @click="startCompanyCrawl(false)"
+                  >
+                    爬取选中站点（{{ selectedCandidateUrls.length }}）
+                  </button>
+                  <button
+                    class="btn btn-secondary btn-small"
+                    :disabled="status === 'running' || !companyCandidates.length"
+                    @click="startCompanyCrawl(true)"
+                  >
+                    全部爬取（{{ companyCandidates.length }}）
+                  </button>
+                </div>
+              </div>
+              <div v-if="resultMeta?.kbIngest" class="meta-warn">知识库：{{ resultMeta.kbIngest }}</div>
               <div v-if="canSendFeedback" class="feedback-row">
                 <button class="btn btn-secondary btn-small" @click="sendFeedback(1)">有帮助</button>
                 <button class="btn btn-secondary btn-small" @click="sendFeedback(-1)">不准</button>
@@ -263,6 +363,33 @@
                     <span v-if="it.artist" class="item-pill">{{ it.artist }}</span>
                     <span v-if="it.quote" class="item-dim">{{ it.quote }}</span>
                     <span v-else-if="it.info" class="item-dim">{{ it.info }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="attachmentFiles.length" class="items-block">
+              <div class="items-title">已下载站内挂载文件 {{ attachmentFiles.length }} 个</div>
+              <div class="items-list">
+                <div v-for="(f, idx) in attachmentFiles" :key="'att_' + idx" class="item-row">
+                  <div class="item-main">
+                    <span class="item-pill">文件</span>
+                    <a
+                      v-if="safeHttpUrl(f.url)"
+                      class="item-link"
+                      :href="safeHttpUrl(f.url)"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      {{ f.filename }}
+                    </a>
+                    <span v-else class="item-text">{{ f.filename }}</span>
+                  </div>
+                  <div class="item-sub">
+                    <span class="item-dim">
+                      {{ Math.round((f.size || 0) / 1024) }} KB · {{ f.contentType || f.ext || '' }}
+                      <template v-if="f.path"> · {{ f.path }}</template>
+                    </span>
                   </div>
                 </div>
               </div>
@@ -409,6 +536,8 @@ onMounted(() => {
 async function loadAgentConfig() {
   try {
     agentConfig.value = await $fetch('/api/config')
+    const kb = agentConfig.value?.companyCrawl
+    if (kb?.kbGraphUi) kbUiUrl.value = String(kb.kbGraphUi)
   } catch {
     agentConfig.value = null
   }
@@ -564,6 +693,13 @@ const resultMeta = computed(() => {
     templateHit: Boolean(meta.template_hit ?? r.meta?.template_hit),
     patchHit: Boolean(meta.patch_hit ?? r.meta?.patch_hit),
     routeSuggestion: String(r.agentResult?.structured?.route_suggestion ?? ''),
+    kbIngest: (() => {
+      const k = meta.kb_ingest as any
+      if (!k) return ''
+      return k.ok
+        ? `ingest 完成（快照 ${k.snapshot_id}，三元组 ${k.triplets}，实体页 ${k.wiki_pages}）`
+        : `ingest 失败：${k.error || '未知原因'}`
+    })(),
   }
 })
 
@@ -591,6 +727,110 @@ function applyClarifyChip(chip: string) {
 const canSendFeedback = computed(() => {
   const r = result.value
   return Boolean(r && task.value.trim() && (r.status === 'ok' || r.status === 'partial_ok'))
+})
+
+// ── 公司爬取：官网候选 / 条件特征 / 挂载文件 ──
+const companyName = ref('')
+const companyTraits = ref('')
+const collectAttachments = ref(true)
+const companySearching = ref(false)
+const companyCandidates = ref<any[]>([])
+const companySearchMessage = ref('')
+const selectedCandidateUrls = ref<string[]>([])
+const kbUiUrl = ref('http://127.0.0.1:13105')
+
+const isCompanyCandidatesClarify = computed(
+  () =>
+    result.value?.status === 'needs_clarification' &&
+    result.value?.clarify?.reason === 'company_candidates',
+)
+const companyClarifyQuestion = computed(() => {
+  const q = result.value?.clarify?.questions || []
+  return q.length ? q.join('；') : '找到多个候选网站，请选择要爬取的站点'
+})
+
+const attachmentFiles = computed<any[]>(() =>
+  (Array.isArray(result.value?.attachments) ? result.value.attachments : []).filter((f: any) => f?.ok && f?.path),
+)
+
+function clearCandidates() {
+  companyCandidates.value = []
+  selectedCandidateUrls.value = []
+  companySearchMessage.value = ''
+}
+
+function openKbUi() {
+  window.open(kbUiUrl.value, '_blank', 'noopener')
+}
+
+async function searchCompanySites() {
+  const name = String(companyName.value ?? '').trim()
+  if (!name) {
+    pushLog('warn', '请先填写公司名称')
+    return
+  }
+  companySearching.value = true
+  companyCandidates.value = []
+  selectedCandidateUrls.value = []
+  companySearchMessage.value = ''
+  try {
+    const res = await $fetch<any>('/api/company/search', {
+      method: 'POST',
+      body: { companyName: name, traits: companyTraits.value },
+    })
+    companyCandidates.value = Array.isArray(res?.candidates) ? res.candidates : []
+    companySearchMessage.value = String(res?.message ?? res?.error ?? '')
+    pushLog(res?.ok ? 'info' : 'warn', `公司解析：${companySearchMessage.value || res?.error || '无候选'}`)
+  } catch (e: any) {
+    pushLog('error', `公司解析失败：${String(e?.message || e)}`)
+  } finally {
+    companySearching.value = false
+  }
+}
+
+function startCompanyCrawl(crawlAll: boolean) {
+  const clarifyName = String(result.value?.clarify?.companyName ?? '').trim()
+  const name = String(companyName.value ?? '').trim() || clarifyName
+  if (!name) {
+    pushLog('warn', '公司名称为空，无法发起公司爬取')
+    return
+  }
+  const urls = crawlAll
+    ? companyCandidates.value.map((c) => String(c.url ?? '').trim()).filter(Boolean)
+    : selectedCandidateUrls.value.slice()
+  if (!urls.length) {
+    pushLog('warn', '请先勾选要爬取的网站')
+    return
+  }
+  if (!companyName.value.trim() && clarifyName) companyName.value = clarifyName
+  const traits = String(companyTraits.value ?? '').trim()
+  task.value = `帮我爬取${name}官网的整站信息${traits ? `（条件特征：${traits}）` : ''}，包括页面内容和站内挂载文件`
+  ;(options as any).__managerSeedUrls = urls
+  ;(options as any).__seedFirstMode = true
+  ;(options as any).companyCrawl = true
+  ;(options as any).companyName = name
+  ;(options as any).companyTraits = traits
+  ;(options as any).collectAttachments = collectAttachments.value
+  ;(options as any).siteCrawl = true
+  ;(options as any).maxPages = Math.max(Number(options.maxPages ?? 0), 8)
+  ;(options as any).maxDepth = Math.max(Number(options.maxDepth ?? 0), 2)
+  pushLog('info', `公司爬取：已选 ${urls.length} 个站点，开始任务`)
+  start()
+}
+
+// 澄清返回多个候选网站时：自动填充候选列表并默认全选
+watch(isCompanyCandidatesClarify, (v) => {
+  if (!v) return
+  const cands = Array.isArray(result.value?.clarify?.candidates) ? result.value.clarify.candidates : []
+  companyCandidates.value = cands.slice()
+  selectedCandidateUrls.value = cands.map((c: any) => String(c?.url ?? '').trim()).filter(Boolean)
+  companySearchMessage.value = companyClarifyQuestion.value
+  const clarifyName = String(result.value?.clarify?.companyName ?? '').trim()
+  if (clarifyName && !companyName.value.trim()) companyName.value = clarifyName
+  const traits = result.value?.clarify?.companyTraits
+  if (Array.isArray(traits) && traits.length && !companyTraits.value.trim()) {
+    companyTraits.value = traits.join('，')
+  }
 })
 
 async function sendFeedback(score: 1 | -1) {
@@ -1565,6 +1805,96 @@ body {
   color: var(--text-dim);
   margin-bottom: 10px;
 }
+
+/* ── 公司爬取面板 ── */
+.company-panel {
+  margin-top: 12px;
+}
+
+.company-inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.company-input,
+.company-traits {
+  width: 100%;
+  font-size: 13px;
+}
+
+.company-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+}
+
+.company-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.candidate-list {
+  margin-top: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.candidate-tip {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+
+.candidate-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12.5px;
+}
+
+.candidate-row input[type='checkbox'] {
+  margin-top: 3px;
+}
+
+.candidate-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  cursor: pointer;
+}
+
+.cand-title {
+  color: var(--text-main);
+}
+
+.cand-host {
+  color: #7fb0ff;
+  font-size: 11.5px;
+  word-break: break-all;
+}
+
+.cand-excerpt {
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+.candidate-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 
 .items-list {
   display: flex;

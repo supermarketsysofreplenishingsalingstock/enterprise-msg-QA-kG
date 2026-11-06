@@ -1,0 +1,14 @@
+fastapi>=0.110
+uvicorn[standard]
+pydantic>=2
+python-dotenv>=1.0
+httpx
+# LlamaIndex：DynamicLLMPathExtractor
+llama-index-core>=0.14.0,<0.15
+llama-index-llms-openai-like>=0.3
+# 网页 / 文件解析
+beautifulsoup4>=4.12
+lxml
+pypdf>=4.0
+python-docx>=1.1
+openpyxl>=3.1

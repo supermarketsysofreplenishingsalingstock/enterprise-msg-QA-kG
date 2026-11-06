@@ -16,6 +16,7 @@ import {
 import { buildTaskPreflight, detectTaskConflictsAndAmbiguity } from './crawlerAgentTaskPlanning'
 import { runCrawlerWorkflow } from './crawlerAgentWorkflow'
 import type { CrawlerAgentOptions, RunParams } from './crawlerAgentTypes'
+import { detectCompanyCrawl, searchCompanySites } from './companySiteResolver'
 
 export type { CrawlerAgentOptions } from './crawlerAgentTypes'
 export { needsCrawlerClarifyStructural } from './crawlerAgentPlan'
@@ -64,8 +65,99 @@ export async function runCrawlerAgent(params: RunParams) {
     params.options,
   )
   const heuristicPreview = buildHeuristicPlan(params.task, params.options, taskPlan)
-  const previewSeed = String(heuristicPreview.seedUrls?.[0] ?? '').trim()
-  if (isUnresolvedSeed(previewSeed) && taskPlan.targetSite === 'generic') {
+  let previewSeed = String(heuristicPreview.seedUrls?.[0] ?? '').trim()
+  let companySeedsApplied = false
+
+  // ── 公司爬取：公司名 → 候选官网 → 多个候选时向用户澄清 ──
+  const companyMode = detectCompanyCrawl(params.task, params.options)
+  const managerSeedsBefore = Array.isArray((params.options as any)?.__managerSeedUrls)
+    ? (params.options as any).__managerSeedUrls
+    : []
+  if (companyMode && managerSeedsBefore.length === 0 && taskPlan.targetSite === 'generic') {
+    params.emit({
+      type: 'log',
+      payload: {
+        level: 'info',
+        message: `公司爬取：解析「${companyMode.companyName}」的官网候选…`,
+        ts: Date.now(),
+      },
+    })
+    const candidates = await searchCompanySites(
+      companyMode.companyName,
+      companyMode.traits,
+      params.config,
+      params.signal,
+      (level, message) =>
+        params.emit({ type: 'log', payload: { level, message, ts: Date.now() } }),
+    )
+    ;(params.options as any).__companyCrawl = true
+    ;(params.options as any).__companyName = companyMode.companyName
+    ;(params.options as any).__companyTraits = companyMode.traits
+    // 默认开启附件收集与整站模式（公司网站要尽量抓全）
+    if ((params.options as any).collectAttachments === undefined) {
+      ;(params.options as any).collectAttachments = true
+    }
+    if (!(params.options as any).siteCrawl) {
+      ;(params.options as any).siteCrawl = true
+      ;(params.options as any).maxDepth = Math.max(Number((params.options as any).maxDepth ?? 0), 1)
+    }
+    if (candidates.length === 0) {
+      return {
+        task: params.task,
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        status: 'needs_clarification',
+        clarify: {
+          reason: 'company_not_found',
+          missingSlots: ['company_site'],
+          questions: [
+            `未能在公网搜索到「${companyMode.companyName}」的官网候选。请确认公司名称是否正确，或直接提供公司官网 URL。`,
+          ],
+        },
+        items: [],
+        stats: {},
+        taskPlan,
+      }
+    }
+    if (candidates.length > 1) {
+      // 多个候选地址 → 重新问一下用户怎么处理
+      return {
+        task: params.task,
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        status: 'needs_clarification',
+        clarify: {
+          reason: 'company_candidates',
+          missingSlots: ['company_site'],
+          companyName: companyMode.companyName,
+          companyTraits: companyMode.traits,
+          candidates,
+          questions: [
+            `「${companyMode.companyName}」在公网搜索到 ${candidates.length} 个候选网站，请选择要爬取的网站（可多选，或全部爬取）。`,
+          ],
+        },
+        items: [],
+        stats: {},
+        taskPlan,
+      }
+    }
+    // 唯一候选 → 直接作为种子
+    ;(params.options as any).__managerSeedUrls = [candidates[0].url]
+    ;(params.options as any).__seedFirstMode = true
+    ;(params.options as any).__openWebDiscovery = false
+    companySeedsApplied = true
+    previewSeed = candidates[0].url
+    params.emit({
+      type: 'log',
+      payload: {
+        level: 'info',
+        message: `公司爬取：唯一候选官网 ${candidates[0].url}，直接开始爬取`,
+        ts: Date.now(),
+      },
+    })
+  }
+
+  if (!companySeedsApplied && isUnresolvedSeed(previewSeed) && taskPlan.targetSite === 'generic') {
     return {
       task: params.task,
       startedAt: new Date().toISOString(),

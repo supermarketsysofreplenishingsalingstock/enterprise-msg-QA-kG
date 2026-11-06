@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>公司信息知识库 · LLM Wiki 图谱</title>
+<script src="/static/vendor/echarts.min.js"></script>
+<script>
+  if (typeof echarts === "undefined") {
+    document.write('<script src="https://registry.npmmirror.com/echarts/5.5.0/files/dist/echarts.min.js"><\/script>');
+  }
+</script>
+<style>
+  :root{
+    --bg:#0d1420;--panel:#111a29;--panel2:#152134;--line:#22344e;--txt:#d8e1ea;
+    --muted:#8296ab;--accent:#4f8ef7;--ok:#34c77b;--warn:#f0a132;--bad:#ef5b5b;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);font-family:"Segoe UI","Microsoft YaHei",sans-serif;font-size:14px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  header{padding:10px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:var(--panel)}
+  header h1{font-size:16px;font-weight:500;color:#fff}
+  header .sub{color:var(--muted);font-size:12px}
+  .tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-left:auto}
+  select,input[type=text]{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:6px;padding:5px 9px;font-size:13px;outline:none}
+  select:focus,input:focus{border-color:var(--accent)}
+  button{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:6px;padding:5px 12px;font-size:13px;cursor:pointer}
+  button:hover{border-color:var(--accent);color:#fff}
+  button.primary{background:#1d3a66;border-color:#2f6bbf;color:#cfe2ff}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .tabs{display:flex;gap:6px}
+  .tab{padding:5px 14px;border-radius:6px;cursor:pointer;border:1px solid transparent;color:var(--muted);font-size:13px}
+  .tab.active{background:var(--panel2);border-color:var(--line);color:#fff}
+  main{flex:1;display:flex;min-height:0}
+  #graphWrap{flex:1;position:relative;min-width:0}
+  #graphChart{width:100%;height:100%}
+  .counts{position:absolute;left:14px;bottom:12px;color:var(--muted);font-size:12px;background:rgba(13,20,32,.75);padding:4px 10px;border-radius:6px;border:1px solid var(--line)}
+  aside{width:340px;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
+  aside .panel-head{padding:10px 14px;border-bottom:1px solid var(--line);font-size:13px;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+  aside .panel-body{flex:1;overflow-y:auto;padding:12px 14px}
+  aside h3{font-size:15px;color:#fff;margin-bottom:8px}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12.5px;margin-bottom:12px}
+  .kv .k{color:var(--muted)}
+  .kv .v{word-break:break-all}
+  .rel-item{padding:6px 8px;border:1px solid var(--line);border-radius:6px;margin-bottom:6px;font-size:12.5px;background:var(--panel2)}
+  .rel-item b{color:#9db8d8;font-weight:500}
+  .rel-props{color:var(--muted);margin-top:2px}
+  .rel-snap{color:#6f86a0;font-size:11px}
+  /* diff */
+  #diffView{display:none;flex:1;overflow-y:auto;padding:14px 18px}
+  .diff-head{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+  table.diff{width:100%;border-collapse:collapse;font-size:12.5px;margin-bottom:18px}
+  table.diff th,table.diff td{border:1px solid var(--line);padding:5px 8px;text-align:left;vertical-align:top}
+  table.diff th{background:var(--panel2);color:var(--muted);font-weight:500}
+  .tag-add{color:var(--ok)}.tag-rm{color:var(--bad)}.tag-ch{color:var(--warn)}
+  /* wiki */
+  #wikiView{display:none;flex:1;overflow-y:auto;padding:14px 18px}
+  .wiki-page-list{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+  .wiki-page-list button{font-size:12px}
+  .wiki-content{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px 20px;line-height:1.7;font-size:13.5px}
+  .wiki-content h1{font-size:18px;margin:10px 0}.wiki-content h2{font-size:15px;margin:14px 0 8px;color:#9db8d8}
+  .wiki-content table{border-collapse:collapse;margin:8px 0}.wiki-content td,.wiki-content th{border:1px solid var(--line);padding:4px 10px;font-size:12.5px}
+  .wiki-content a{color:#7fb0ff;text-decoration:none}
+  .empty-hint{color:var(--muted);padding:40px;text-align:center;line-height:2}
+  .loading{position:absolute;top:12px;left:14px;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>公司信息知识库 · LLM Wiki 图谱</h1>
+    <div class="sub">DynamicLLMPathExtractor 开放式抽取 · 不预设 schema · 属性全保留 · 快照可对比</div>
+  </div>
+  <div class="tabs">
+    <div class="tab active" data-view="graph">图谱</div>
+    <div class="tab" data-view="diff">快照对比</div>
+    <div class="tab" data-view="wiki">Wiki 页面</div>
+  </div>
+  <div class="tools" id="graphTools">
+    <select id="selCompany" title="公司"><option value="">加载中…</option></select>
+    <select id="selSnapshot" title="快照"><option value="latest">最新快照</option><option value="all">全部合并</option></select>
+    <select id="selCategory" title="实体类别"><option value="">全部类别</option></select>
+    <select id="selLimit" title="节点上限">
+      <option>200</option><option selected>300</option><option>500</option><option>1000</option>
+    </select>
+    <input type="text" id="inpSearch" placeholder="搜索实体…" style="width:150px" />
+    <button onclick="loadGraph()">刷新</button>
+  </div>
+  <div class="tools" id="diffTools" style="display:none">
+    <select id="selSnapA"></select>
+    <span style="color:var(--muted)">→</span>
+    <select id="selSnapB"></select>
+    <button class="primary" onclick="loadDiff()">对比</button>
+  </div>
+  <div class="tools" id="wikiTools" style="display:none">
+    <button onclick="openWikiIndex()">查看 index.md / log.md</button>
+    <button onclick="loadWikiPages()">刷新页面列表</button>
+  </div>
+</header>
+
+<main>
+  <div id="graphWrap">
+    <div id="graphChart"></div>
+    <div class="counts" id="countsLabel"></div>
+    <div class="loading" id="loadingLabel" style="display:none">加载中…</div>
+  </div>
+  <div id="diffView"></div>
+  <div id="wikiView"></div>
+
+  <aside id="detailPanel" style="display:none">
+    <div class="panel-head"><span>实体详情</span><button onclick="closeDetail()">×</button></div>
+    <div class="panel-body" id="detailBody"></div>
+  </aside>
+</main>
+
+<script>
+const API = "";
+let chart = null;
+let graphNodes = [];
+let currentCompany = "";
+
+// ───────── 工具 ─────────
+function esc(s){const d=document.createElement("div");d.textContent=String(s??"");return d.innerHTML}
+function fmtTs(s){return String(s||"").replace("T"," ").slice(0,16)}
+function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms)}}
+
+async function getJSON(url){const r=await fetch(url);if(!r.ok){let m="";try{m=(await r.json()).detail||""}catch{}throw new Error(m||r.statusText)}return r.json()}
+
+// ───────── 公司 / 快照 / 类别加载 ─────────
+async function loadCompanies(){
+  try{
+    const d=await getJSON(API+"/api/companies");
+    const list=d.companies||[];
+    const sel=document.getElementById("selCompany");
+    sel.innerHTML=list.length
+      ? list.map(c=>`<option value="${esc(c.slug)}">${esc(c.name)}（${c.snapshot_count||0}快照/${c.entity_count||0}实体）</option>`).join("")
+      : `<option value="">（暂无公司，请先在爬虫端爬取）</option>`;
+    if(list.length){currentCompany=sel.value;await onCompanyChange()}
+  }catch(e){document.getElementById("selCompany").innerHTML=`<option value="">加载失败</option>`}
+}
+
+async function onCompanyChange(){
+  currentCompany=document.getElementById("selCompany").value;
+  if(!currentCompany)return;
+  const [snapD,catD]=await Promise.all([
+    getJSON(`${API}/api/snapshots?company=${encodeURIComponent(currentCompany)}`),
+    getJSON(`${API}/api/categories?company=${encodeURIComponent(currentCompany)}`),
+  ]);
+  const snaps=snapD.snapshots||[];
+  const selSnap=document.getElementById("selSnapshot");
+  selSnap.innerHTML=`<option value="latest">最新快照</option><option value="all">全部合并</option>`+
+    snaps.map(s=>`<option value="${esc(s.snapshot_id)}">${esc(s.snapshot_id)}（${fmtTs(s.crawl_time)}，三元组 ${s.triplet_count}）</option>`).join("");
+  fillDiffSelectors(snaps);
+  const selCat=document.getElementById("selCategory");
+  selCat.innerHTML=`<option value="">全部类别</option>`+
+    (catD.categories||[]).map(c=>`<option value="${esc(c.category)}">${esc(c.category)}（${c.count}）</option>`).join("");
+  loadGraph();
+}
+
+function fillDiffSelectors(snaps){
+  const opts=snaps.map(s=>`<option value="${esc(s.snapshot_id)}">${esc(s.snapshot_id)}（${fmtTs(s.crawl_time)}）</option>`).join("");
+  document.getElementById("selSnapA").innerHTML=opts;
+  document.getElementById("selSnapB").innerHTML=opts;
+  const sa=document.getElementById("selSnapA"),sb=document.getElementById("selSnapB");
+  if(sa.options.length>1){sa.selectedIndex=Math.min(1,sa.options.length-1);sb.selectedIndex=0}
+}
+
+// ───────── 图谱 ─────────
+const colorPool=["#4f8ef7","#34c77b","#f0a132","#ef5b5b","#a06ef5","#22c3d6","#e56db1","#8bc34a","#ff8a65","#90a4ae","#ffd54f","#7986cb"];
+
+async function loadGraph(){
+  if(!currentCompany)return;
+  const category=document.getElementById("selCategory").value;
+  const snapshot=document.getElementById("selSnapshot").value;
+  const limit=document.getElementById("selLimit").value;
+  const search=document.getElementById("inpSearch").value.trim();
+  document.getElementById("loadingLabel").style.display="block";
+  try{
+    const url=`${API}/api/graph/data?company=${encodeURIComponent(currentCompany)}&snapshot=${encodeURIComponent(snapshot)}&limit=${limit}`+
+      (category?`&category=${encodeURIComponent(category)}`:"")+(search?`&search=${encodeURIComponent(search)}`:"");
+    const data=await getJSON(url);
+    renderGraph(data);
+  }catch(e){alert("图谱加载失败："+e.message)}
+  finally{document.getElementById("loadingLabel").style.display="none"}
+}
+
+function renderGraph(data){
+  graphNodes=data.nodes||[];
+  const types=[...new Set(graphNodes.map(n=>n.type||"其他"))];
+  const typeColor={};types.forEach((t,i)=>typeColor[t]=colorPool[i%colorPool.length]);
+  const eNodes=graphNodes.map(n=>({
+    id:n.id,name:n.name,
+    symbolSize:Math.min(46,10+Math.sqrt(n.degree||1)*6),
+    category:types.indexOf(n.type||"其他"),
+    itemStyle:{color:typeColor[n.type||"其他"]},
+    label:{show:(n.degree||0)>=1||graphNodes.length<=80,fontSize:11,color:"#d8e1ea"},
+  }));
+  const eEdges=(data.edges||[]).map(e=>({
+    source:e.source,target:e.target,
+    lineStyle:{width:1.2,color:"#4a5a6e",curveness:0.15},
+    label:{show:false,formatter:e.relation,fontSize:10,color:"#8296ab"},
+  }));
+  if(!chart)chart=echarts.init(document.getElementById("graphChart"),null,{renderer:"canvas"});
+  window.addEventListener("resize",()=>chart.resize());
+  chart.setOption({
+    backgroundColor:"transparent",
+    tooltip:{
+      formatter:p=>p.dataType==="edge"
+        ?`<b>${esc(p.data.source&&edgeName(p.data.source))} —[${esc(p.data.label.formatter)}]→ ${esc(edgeName(p.data.target))}</b>${edgePropsTip(p.data)}`
+        :`<b>${esc(p.name)}</b><br/>类型: ${esc(nodeType(p.data.id))}`,
+      extraCssText:"max-width:420px;white-space:normal;"
+    },
+    legend:{data:types,type:"scroll",bottom:10,textStyle:{color:"#8296ab"}},
+    series:[{
+      type:"graph",layout:"force",roam:true,draggable:true,
+      categories:types.map(t=>({name:t})),
+      data:eNodes,links:eEdges,
+      force:{repulsion:160,edgeLength:[40,120],gravity:0.08,layoutAnimation:true},
+      emphasis:{focus:"adjacency",lineStyle:{width:2.5},label:{show:true}},
+      edgeSymbol:["none","arrow"],edgeSymbolSize:6,
+      labelLayout:{hideOverlap:true},
+    }],
+  },true);
+  const c=data.counts||{};
+  document.getElementById("countsLabel").textContent=
+    `实体 ${graphNodes.length}/${c.entities||0} · 关系 ${(data.edges||[]).length}/${c.triplets||0} · 文本块 ${c.chunks||0} · 快照 ${c.snapshots||0}`;
+}
+function nodeType(id){const n=graphNodes.find(n=>n.id===id);return n?n.type:""}
+function edgeName(id){const n=graphNodes.find(n=>n.id===id);return n?n.name:id}
+function edgePropsTip(edge){
+  const p=edge&&edge.properties?Object.entries(edge.properties):[];
+  if(!p.length)return"";
+  return "<br/>"+p.slice(0,8).map(([k,v])=>`${esc(k)}: ${esc(v)}`).join("；");
+}
+
+chart=echarts.init(document.getElementById("graphChart"),null,{renderer:"canvas"});
+chart.on("click",params=>{if(params.dataType==="node")showDetail(params.data.id)});
+
+async function showDetail(ekey){
+  if(!currentCompany)return;
+  try{
+    const d=await getJSON(`${API}/api/graph/entity/${encodeURIComponent(ekey)}?company=${encodeURIComponent(currentCompany)}`);
+    const body=document.getElementById("detailBody");
+    const props=Object.entries(d.properties||{});
+    body.innerHTML=`
+      <h3>${esc(d.name)}</h3>
+      <div class="kv">
+        <span class="k">类型</span><span class="v">${esc(d.type||"其他")}${(d.types||[]).length>1?"（"+d.types.map(esc).join("、")+"）":""}</span>
+        <span class="k">首见快照</span><span class="v">${esc(d.first_snapshot||"--")}</span>
+        <span class="k">最近快照</span><span class="v">${esc(d.last_snapshot||"--")}</span>
+      </div>
+      ${props.length?`<div class="kv">${props.map(([k,v])=>`<span class="k">${esc(k)}</span><span class="v">${esc(v)}</span>`).join("")}</div>`:""}
+      <h3 style="font-size:13px;color:#8296ab">关系（${d.relations.length}）</h3>
+      ${d.relations.map(r=>`
+        <div class="rel-item">
+          <b>${r.direction==="out"?"→":"←"} ${esc(r.relation)}</b>
+          <a href="javascript:void 0" onclick="showDetail('${esc(r.other_id)}')" style="color:#7fb0ff">${esc(r.other)}</a>
+          ${Object.keys(r.properties||{}).length?`<div class="rel-props">${Object.entries(r.properties).slice(0,6).map(([k,v])=>`${esc(k)}: ${esc(v)}`).join("；")}</div>`:""}
+          <div class="rel-snap">${esc(r.snapshot_id||"")} ${esc(fmtTs(r.crawl_time))}${r.source_url?` · <a href="${esc(r.source_url)}" target="_blank" style="color:#5f86b3">来源</a>`:""}</div>
+        </div>`).join("")}`;
+    document.getElementById("detailPanel").style.display="flex";
+  }catch(e){alert("详情加载失败："+e.message)}
+}
+function closeDetail(){document.getElementById("detailPanel").style.display="none"}
+
+// ───────── 快照对比 ─────────
+async function loadDiff(){
+  const a=document.getElementById("selSnapA").value,b=document.getElementById("selSnapB").value;
+  if(!a||!b||a===b){alert("请选择两个不同的快照");return}
+  const d=await getJSON(`${API}/api/graph/diff?company=${encodeURIComponent(currentCompany)}&a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`);
+  const row=t=>`<tr><td>${esc(t.src||"")}</td><td>${esc(t.relation||"")}</td><td>${esc(t.dst||"")}</td><td>${esc(Object.entries(t.props||{}).map(([k,v])=>k+": "+v).join("；"))}</td><td>${esc(t.crawl_time||"")}</td></tr>`;
+  const chRow=c=>`<tr><td>${esc(c.after.src||"")}</td><td>${esc(c.after.relation||"")}</td><td>${esc(c.after.dst||"")}</td><td>${esc(JSON.stringify(c.before.props||{}))} → ${esc(JSON.stringify(c.after.props||{}))}</td></tr>`;
+  document.getElementById("diffView").innerHTML=`
+    <div class="diff-head">
+      <b>${esc(a)}</b><span style="color:var(--muted)">→</span><b>${esc(b)}</b>
+      <span class="tag-add">新增 ${d.summary.added}</span>
+      <span class="tag-rm">移除 ${d.summary.removed}</span>
+      <span class="tag-ch">变化 ${d.summary.changed}</span>
+    </div>
+    <h3 class="tag-add">新增关系（出现在 ${esc(b)}）</h3>
+    <table class="diff"><tr><th>主体</th><th>关系</th><th>客体</th><th>属性</th><th>爬取时间</th></tr>${d.added.map(row).join("")||"<tr><td colspan='5'>无</td></tr>"}</table>
+    <h3 class="tag-rm">移除关系（仅存在于 ${esc(a)}）</h3>
+    <table class="diff"><tr><th>主体</th><th>关系</th><th>客体</th><th>属性</th><th>爬取时间</th></tr>${d.removed.map(row).join("")||"<tr><td colspan='5'>无</td></tr>"}</table>
+    <h3 class="tag-ch">属性 / 类型变化</h3>
+    <table class="diff"><tr><th>主体</th><th>关系</th><th>客体</th><th>变化</th></tr>${d.changed.map(chRow).join("")||"<tr><td colspan='4'>无</td></tr>"}</table>`;
+}
+
+// ───────── Wiki 页面 ─────────
+let wikiPagesCache=[];
+async function loadWikiPages(){
+  if(!currentCompany)return;
+  const d=await getJSON(`${API}/api/wiki/pages?company=${encodeURIComponent(currentCompany)}`);
+  wikiPagesCache=d.pages||[];
+  const box=document.getElementById("wikiView");
+  box.innerHTML=`
+    <div class="wiki-page-list">
+      ${wikiPagesCache.map(p=>`<button onclick="openWikiPage('${esc(p.file)}')">${esc(p.title)}</button>`).join("")||'<span class="empty-hint">暂无 Wiki 页面</span>'}
+    </div>
+    <div class="wiki-content" id="wikiContent">请选择一个页面…</div>`;
+}
+async function openWikiPage(file){
+  const d=await getJSON(`${API}/api/wiki/page?company=${encodeURIComponent(currentCompany)}&name=${encodeURIComponent(file.replace(/\.md$/,""))}`);
+  document.getElementById("wikiContent").innerHTML=renderMd(d.content);
+}
+async function openWikiIndex(){
+  await loadWikiPages();
+  const d=await getJSON(`${API}/api/wiki/index?company=${encodeURIComponent(currentCompany)}`);
+  const box=document.getElementById("wikiView");
+  const pre=document.createElement("div");
+  pre.className="wiki-content";
+  pre.innerHTML=`<h2>index.md</h2><pre style="white-space:pre-wrap;font-size:12.5px">${esc(d.index||"（空）")}</pre><h2>log.md（最近）</h2><pre style="white-space:pre-wrap;font-size:12.5px">${esc(d.log||"（空）")}</pre>`;
+  box.appendChild(pre);
+  box.scrollTop=0;
+}
+function renderMd(md){
+  // 轻量 markdown 渲染：标题 / 表格 / 链接 / 加粗 / 分隔线
+  let html=esc(md||"");
+  html=html.replace(/^###### (.*)$/gm,"<h6>$1</h6>").replace(/^##### (.*)$/gm,"<h5>$1</h5>")
+    .replace(/^#### (.*)$/gm,"<h4>$1</h4>").replace(/^### (.*)$/gm,"<h3>$1</h3>")
+    .replace(/^## (.*)$/gm,"<h2>$1</h2>").replace(/^# (.*)$/gm,"<h1>$1</h1>");
+  html=html.replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>");
+  html=html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,(m,label,url)=>/^https?:\/\//.test(url)?`<a href="${url}" target="_blank">${label}</a>`:label);
+  html=html.replace(/^---$/gm,"<hr/>");
+  html=html.replace(/^\|(.+)\|$/gm,(m,row)=>{
+    const cells=row.split("|").map(c=>c.trim());
+    if(cells.every(c=>/^:?-{3,}:?$/.test(c)||c===""))return"";
+    return`<tr>${cells.map(c=>`<td>${c}</td>`).join("")}</tr>`;
+  });
+  html=html.replace(/((?:<tr>.*<\/tr>\n?)+)/g,"<table>$1</table>");
+  html=html.split(/\n{2,}/).map(b=>/^<(h\d|table|hr|ul|ol)/.test(b.trim())?b:`<p>${b.replace(/\n/g,"<br/>")}</p>`).join("\n");
+  return html;
+}
+
+// ───────── 事件绑定 ─────────
+document.querySelectorAll(".tab").forEach(tab=>{
+  tab.addEventListener("click",()=>{
+    document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+    tab.classList.add("active");
+    const v=tab.dataset.view;
+    document.getElementById("graphWrap").style.display=v==="graph"?"block":"none";
+    document.getElementById("diffView").style.display=v==="diff"?"block":"none";
+    document.getElementById("wikiView").style.display=v==="wiki"?"block":"none";
+    document.getElementById("graphTools").style.display=v==="graph"?"flex":"none";
+    document.getElementById("diffTools").style.display=v==="diff"?"flex":"none";
+    document.getElementById("wikiTools").style.display=v==="wiki"?"flex":"none";
+    if(v==="graph"&&chart)chart.resize();
+    if(v==="wiki")loadWikiPages();
+  });
+});
+document.getElementById("selCompany").addEventListener("change",onCompanyChange);
+document.getElementById("selSnapshot").addEventListener("change",loadGraph);
+document.getElementById("selCategory").addEventListener("change",loadGraph);
+document.getElementById("selLimit").addEventListener("change",loadGraph);
+document.getElementById("inpSearch").addEventListener("input",debounce(loadGraph,400));
+
+loadCompanies();
+</script>
+</body>
+</html>

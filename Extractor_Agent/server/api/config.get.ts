@@ -50,6 +50,12 @@ export default defineEventHandler(() => {
       fields: ['seed_urls', 'serp_context', 'refined_task', 'preferred_channel', 'open_web_discovery'],
       seedFirst: true,
     },
+    companyCrawl: {
+      kbServiceUrl: env.kbServiceUrl,
+      kbGraphUi: `${env.kbServiceUrl.replace(/\/$/, '')}/`,
+      kbAutoIngest: env.kbAutoIngest,
+      attachmentMax: env.attachmentMaxDefault,
+    },
     patches: listPatchSummary(),
     extractPaths: ['patch', 'template', 'rule', 'llm', 'heuristic', 'bing_serp', 'serp_fallback'],
     extractorModes: [

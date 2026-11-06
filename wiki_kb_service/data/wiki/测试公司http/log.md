@@ -1,0 +1,2 @@
+- [2026-11-06 17:50:32] ingest 快照 snap_20261106_174904_cf14：来源 页面1/文件0，chunk 1，新抽取三元组 0，更新实体页 1；LLM={"provider": "local_deepseek", "model": "deepseek-r1:14b", "base_url": "http://localhost:11434/v1"}
+- [2026-11-06 17:52:01] ingest 快照 snap_20261106_175201_0c8a：来源 页面1/文件0，chunk 1，新抽取三元组 0，更新实体页 1；LLM={"provider": "local_deepseek", "model": "deepseek-r1:14b", "base_url": "http://localhost:11434/v1"}

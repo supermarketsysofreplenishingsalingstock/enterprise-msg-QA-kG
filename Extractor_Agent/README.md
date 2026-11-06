@@ -207,3 +207,45 @@ npm run build
 ## 文档
 
 - 待办：[docs/Skill化升级计划.md](../docs/Skill化升级计划.md)（Extractor 章节）
+## 公司信息爬取 + LLM Wiki 知识库（2026-11 新增）
+
+本 Agent 已扩展"公司信息爬取"能力，与同仓 `wiki_kb_service/`（LLM Wiki + 图谱服务，端口 13105）联动：
+
+### 功能
+
+1. **公司站点解析与澄清**：只输入公司名（不输入 URL）时，用 Bing 搜索候选官网；
+   - 找到多个候选 → 返回 `needs_clarification`（reason `company_candidates`），前端展示候选列表让用户勾选"爬取选中/全部爬取"
+   - 找不到 → reason `company_not_found`
+   - 恰好一个 → 自动进入 seed-first 模式爬取
+2. **条件/特征过滤**：`companyTraits` 会并入搜索 query，帮助定位更准确的官网
+3. **网站挂载文件下载**：抓取过程中自动收集页面挂载的 pdf/docx/xlsx/pptx/zip/txt/csv/ofd 等附件并下载（预算 `COMPANY_ATTACH_MAX`，默认 20 个）
+4. **自动入库**：公司爬取结束后，自动把页面文本 + 附件文本 POST 到 `wiki_kb_service` 的 `/api/ingest`，完成 LLM Wiki 三层落盘 + 开放式图谱抽取（`DynamicLLMPathExtractor`，不预设 schema、必提属性、宽松解析不丢三元组）
+
+### 前端入口（app/pages/index.vue）
+
+- 任务区新增"公司信息爬取"面板：公司名、公司特征、`collectAttachments` 勾选、"搜索官网候选"按钮
+- 候选澄清卡片：勾选候选网站后"爬取选中"或"全部爬取"
+- 结果区展示：附件下载列表、`kb_ingest` 入库状态（快照 id / 三元组数 / Wiki 页面数）、"知识库/图谱界面"跳转按钮
+
+### 相关环境变量（.env）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `KB_SERVICE_URL` | `http://127.0.0.1:13105` | wiki_kb_service 地址 |
+| `KB_AUTO_INGEST` | `1` | 爬取结束自动入库 |
+| `COMPANY_ATTACH_MAX` | `20` | 单次爬取最多下载的附件数 |
+
+LLM 三选一（本地 DeepSeek / 本地 Ministral / 线上 DeepSeek API）见 `.env.example` 内注释。
+
+### 端到端启动顺序
+
+```bash
+# 1) 启动知识库服务
+cd wiki_kb_service && python run.py        # :13105
+
+# 2) 启动爬虫 Agent
+cd Extractor_Agent && pnpm install && pnpm dev   # :13104
+
+# 3) 浏览器打开爬虫界面，输入公司名 → 搜索候选 → 爬取 → 自动入库
+#    图谱界面： http://127.0.0.1:13105
+```
