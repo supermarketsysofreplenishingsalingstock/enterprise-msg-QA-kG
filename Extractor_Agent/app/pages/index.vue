@@ -150,9 +150,10 @@
               <input v-model="collectAttachments" type="checkbox" />
               下载站内挂载文件（PDF / DOCX / XLSX 等）
             </label>
-            <button type="button" class="btn btn-secondary btn-small" @click="openKbUi">
+            <button type="button" class="btn btn-secondary btn-small" @click="goKbUi">
               知识库 / 图谱界面
             </button>
+            <button type="button" class="btn btn-secondary btn-small" title="在新窗口打开" @click="openKbUi">↗</button>
           </div>
           <div v-if="companyCandidates.length" class="candidate-list">
             <div class="candidate-tip">{{ companySearchMessage || '请选择要爬取的网站（可多选）' }}</div>
@@ -341,7 +342,12 @@
                   </button>
                 </div>
               </div>
-              <div v-if="resultMeta?.kbIngest" class="meta-warn">知识库：{{ resultMeta.kbIngest }}</div>
+              <div v-if="resultMeta?.kbIngest" class="meta-warn">
+                知识库：{{ resultMeta.kbIngest }}
+                <button type="button" class="btn btn-secondary btn-small" style="margin-left:8px" @click="goKbUi">
+                  查看图谱 →
+                </button>
+              </div>
               <div v-if="canSendFeedback" class="feedback-row">
                 <button class="btn btn-secondary btn-small" @click="sendFeedback(1)">有帮助</button>
                 <button class="btn btn-secondary btn-small" @click="sendFeedback(-1)">不准</button>
@@ -761,6 +767,10 @@ function clearCandidates() {
 
 function openKbUi() {
   window.open(kbUiUrl.value, '_blank', 'noopener')
+}
+
+function goKbUi() {
+  navigateTo('/kb')
 }
 
 async function searchCompanySites() {

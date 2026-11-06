@@ -75,6 +75,9 @@
     <div class="tab" data-view="diff">快照对比</div>
     <div class="tab" data-view="wiki">Wiki 页面</div>
   </div>
+  <div class="tools">
+    <a id="crawlerLink" class="tab" style="text-decoration:none" title="回到公司爬取工作台">← 公司爬取</a>
+  </div>
   <div class="tools" id="graphTools">
     <select id="selCompany" title="公司"><option value="">加载中…</option></select>
     <select id="selSnapshot" title="快照"><option value="latest">最新快照</option><option value="all">全部合并</option></select>
@@ -351,6 +354,17 @@ document.getElementById("selSnapshot").addEventListener("change",loadGraph);
 document.getElementById("selCategory").addEventListener("change",loadGraph);
 document.getElementById("selLimit").addEventListener("change",loadGraph);
 document.getElementById("inpSearch").addEventListener("input",debounce(loadGraph,400));
+
+// ── 与爬虫工作台的互通导航 ──
+// ?crawler=<url>  自定义爬虫工作台地址（默认 http://127.0.0.1:13104）
+// ?embed=1        表示当前处于爬虫工作台的 iframe 内，隐藏返回链接（避免嵌套跳转）
+(function(){
+  const q=new URLSearchParams(location.search);
+  const link=document.getElementById("crawlerLink");
+  if(q.get("embed")==="1"){link.style.display="none";return}
+  link.href=(q.get("crawler")||"http://127.0.0.1:13104").trim();
+  link.target="_top"; // iframe 内也能直接跳出
+})();
 
 loadCompanies();
 </script>
