@@ -19,6 +19,8 @@ from typing import Any, List, Tuple
 
 from llama_index.core.indices.property_graph import DynamicLLMPathExtractor
 from llama_index.core.indices.property_graph.transformations.dynamic_llm import (  # noqa: F401
+    DEFAULT_DYNAMIC_EXTRACT_PROMPT,
+    DEFAULT_DYNAMIC_EXTRACT_PROPS_PROMPT,
     default_parse_dynamic_triplets,
     default_parse_dynamic_triplets_with_props,
 )
@@ -26,6 +28,7 @@ from llama_index.core.indices.property_graph.transformations.schema_llm import (
     KG_NODES_KEY,
     KG_RELATIONS_KEY,
 )
+from llama_index.core.prompts import PromptTemplate
 from llama_index.core.schema import TextNode
 from llama_index.core.graph_stores.types import EntityNode, Relation
 
@@ -33,6 +36,41 @@ from . import config
 from .llm_factory import get_llm
 
 _extractor_instance: DynamicLLMPathExtractor | None = None
+
+# ────────────────────────── 抽取提示词 ──────────────────────────
+# 在官方默认提示词（无属性 / 带属性两版）基础上追加"实体粒度规则"：
+#   1) 并列的不同实体必须拆分（禁止 "国家通讯社和阿里巴巴集团" 这种拼接实体）
+#   2) 但并列项若其实是同一个实体（专有名称里的"和"、全称+别名、不可分割机构全称），
+#      必须保持整体不拆 —— 由 LLM 按"拆分后能否各自独立指代"判断
+# 注意：PromptTemplate 用 f-string 渲染，正文里字面量花括号必须写成 {{ }}
+_ENTITY_GRANULARITY_RULES = """
+ENTITY GRANULARITY RULES（实体粒度规则，优先级最高）:
+- 一个实体名只能指一个实体。中文里出现「A和B」「A与B」「A、B」「A及B」「A以及B」这类并列结构时，先判断 A、B 是否各自都能独立指代现实中的不同对象（不同公司、机构、组织、人物、产品、项目、地区）。
+- 若可以独立指代 —— 必须拆成多个独立实体，每个实体单独生成一条三元组，绝不允许把并列项拼成一个实体名。
+  错误示范（禁止）: head='新华智云', relation='INVESTED_BY', tail='国家通讯社和阿里巴巴集团'
+  正确示范: [{{'head': '新华智云', 'relation': 'INVESTED_BY', 'tail': '新华通讯社'}}, {{'head': '新华智云', 'relation': 'INVESTED_BY', 'tail': '阿里巴巴集团'}}]
+- 若并列项其实指向同一个实体 —— 不要拆分，仍然把并列的写法整体保留为一个实体名。典型情形：
+  ① 「和/与/及」不是并列连词，而是专有名称本身的一部分（如「和平饭店」「协和医院」「和记黄埔」「共和银行」）；
+  ② 并列项是同一实体的全称与简称、正式名与别称并置（如「新华通讯社（国家通讯社）」「阿里巴巴集团（阿里）」）；
+  ③ 并列项合起来才构成一个不可分割的唯一指代对象（如「中国银行保险监督管理委员会」「国务院国资委」等法定机构全称）。
+- 别名处理：同一实体有简称/别称时，实体名统一使用最正式完整的名称，别称写进该实体的属性 alias。同一实体在所有三元组中名称必须完全一致（不要一处「阿里巴巴集团」、另一处「阿里」）。
+"""
+
+_PROMPT_ANCHOR = "- Ensure the knowledge graph is coherent and easily understandable"
+
+
+def _build_extract_prompt(with_props: bool) -> PromptTemplate:
+    """官方默认提示词 + 实体粒度规则（两种版本都要补，否则会丢属性抽取）。"""
+    base = (
+        DEFAULT_DYNAMIC_EXTRACT_PROPS_PROMPT if with_props else DEFAULT_DYNAMIC_EXTRACT_PROMPT
+    )
+    tmpl = base.template
+    rules = _ENTITY_GRANULARITY_RULES.strip()
+    if _PROMPT_ANCHOR in tmpl:
+        tmpl = tmpl.replace(_PROMPT_ANCHOR, _PROMPT_ANCHOR + "\n\n" + rules, 1)
+    else:
+        tmpl = tmpl + "\n\n" + rules
+    return PromptTemplate(tmpl)
 
 _FALLBACK_ENTITY_TYPE = "其他"
 _FALLBACK_RELATION = "关联"
@@ -190,16 +228,19 @@ def lenient_parse_fn_with_props(llm_output: str) -> List[Tuple[EntityNode, Relat
 def get_extractor() -> DynamicLLMPathExtractor:
     global _extractor_instance
     if _extractor_instance is None:
+        props_mode = config.resolve_props_mode()
         _extractor_instance = DynamicLLMPathExtractor(
             llm=get_llm(),
+            # 自定义提示词：官方默认 + 实体粒度规则（并列实体拆分 / 同一实体不拆）
+            extract_prompt=_build_extract_prompt(with_props=props_mode is not None),
             max_triplets_per_chunk=config.MAX_TRIPLETS_PER_CHUNK,
             num_workers=config.NUM_WORKERS,
             # 不预设实体类型与关系类型 —— LLM 现场归纳
             allowed_entity_types=None,
             allowed_relation_types=None,
             # 属性：开放生成（语义见 config.resolve_props_mode 的注释）
-            allowed_entity_props=config.resolve_props_mode(),
-            allowed_relation_props=config.resolve_props_mode(),
+            allowed_entity_props=props_mode,
+            allowed_relation_props=props_mode,
             # 宽松解析：不丢弃任何能解析出的三元组
             parse_fn=lenient_parse_fn_with_props,
             # 关键：默认 False 会把 LLM 调用异常（如连不上）吞掉并返回 0 三元组，

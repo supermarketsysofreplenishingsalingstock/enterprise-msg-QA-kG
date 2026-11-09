@@ -133,6 +133,16 @@ def init_db() -> None:
             conn.execute("ALTER TABLE chunks ADD COLUMN processed INTEGER DEFAULT 1")
         except sqlite3.OperationalError:
             pass  # 列已存在
+        # 旧库迁移：triplets.chunk_id（来源分块，用于「重新抽取选中的内容」精确替换；
+        # 历史行该列为 NULL，重新抽取时按 snapshot+source_url 整源替换兜底）
+        try:
+            conn.execute("ALTER TABLE triplets ADD COLUMN chunk_id INTEGER")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_triplets_chunk ON triplets(chunk_id)")
+        except sqlite3.OperationalError:
+            pass
 
 
 init_db()
@@ -294,13 +304,14 @@ def insert_triplet(
     source_url: str,
     source_title: str,
     source_kind: str,
+    chunk_id: int | None = None,
 ) -> None:
     with _lock, connect() as conn:
         conn.execute(
             "INSERT INTO triplets(company_id, snapshot_id, crawl_time, src_ekey, dst_ekey,"
             " src_name, dst_name, src_type, dst_type, relation, props_json,"
-            " source_url, source_title, source_kind, created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " source_url, source_title, source_kind, chunk_id, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 company_id,
                 snapshot_id,
@@ -316,6 +327,7 @@ def insert_triplet(
                 source_url,
                 source_title,
                 source_kind,
+                chunk_id,
                 now_iso(),
             ),
         )
@@ -450,6 +462,17 @@ def mark_chunks_processed(chunk_ids: list[int]) -> None:
         )
 
 
+def mark_chunks_unprocessed(chunk_ids: list[int]) -> None:
+    """把分块标回待处理（重新抽取失败时用，方便「处理新增内容」重试）。"""
+    if not chunk_ids:
+        return
+    with _lock, connect() as conn:
+        conn.executemany(
+            "UPDATE chunks SET processed=0 WHERE id=?",
+            [(int(i),) for i in chunk_ids],
+        )
+
+
 def insert_raw_source(company_id: int, snapshot_id: str, kind: str, url: str, title: str, path: str, crawl_time: str) -> None:
     with _lock, connect() as conn:
         conn.execute(
@@ -474,3 +497,238 @@ def entities_for_company(company_id: int) -> list[sqlite3.Row]:
         return conn.execute(
             "SELECT * FROM entities WHERE company_id=? ORDER BY name", (company_id,)
         ).fetchall()
+
+
+# ────────────────────────── 重新抽取（选中 chunk） ──────────────────────────
+
+def list_chunks(company_id: int, snapshot_id: str | None = None, limit: int = 1000) -> list[dict]:
+    """列出可重新抽取的 chunk（带来源、快照时间、已产出三元组数）。"""
+    sql = (
+        "SELECT c.id AS chunk_id, c.snapshot_id, c.source_url, c.source_title, c.source_kind,"
+        " c.ord, c.processed, length(c.text) AS text_len, substr(c.text, 1, 160) AS snippet,"
+        " COALESCE(s.crawl_time, '') AS crawl_time,"
+        " (SELECT COUNT(*) FROM triplets t WHERE t.chunk_id = c.id) AS triplet_count,"
+        " (SELECT COUNT(*) FROM triplets t WHERE t.company_id = c.company_id"
+        "   AND t.snapshot_id = c.snapshot_id"
+        "   AND COALESCE(t.source_url,'') = COALESCE(c.source_url,'')) AS source_triplet_count"
+        " FROM chunks c LEFT JOIN snapshots s ON s.snapshot_id = c.snapshot_id"
+        " WHERE c.company_id=?"
+    )
+    args: list[Any] = [company_id]
+    if snapshot_id and snapshot_id not in ("all", "latest"):
+        sql += " AND c.snapshot_id=?"
+        args.append(snapshot_id)
+    sql += " ORDER BY s.crawl_time DESC, c.snapshot_id, c.ord LIMIT ?"
+    args.append(int(limit))
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+
+def get_chunks_by_ids(company_id: int, chunk_ids: list[int]) -> list[dict]:
+    ids = [int(i) for i in (chunk_ids or []) if str(i).strip()]
+    if not ids:
+        return []
+    ph = ",".join("?" for _ in ids)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT c.id AS chunk_id, c.company_id, c.snapshot_id, c.source_url, c.source_title,"
+            " c.source_kind, c.ord, c.text, COALESCE(s.crawl_time, '') AS crawl_time"
+            f" FROM chunks c LEFT JOIN snapshots s ON s.snapshot_id = c.snapshot_id"
+            f" WHERE c.company_id=? AND c.id IN ({ph}) ORDER BY c.ord",
+            [company_id, *ids],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def triplet_counts_by_chunk(company_id: int, chunk_ids: list[int]) -> dict[int, int]:
+    """每个 chunk 当前已产出的三元组条数（用于判断「重新抽取会不会丢东西」）。"""
+    ids = [int(i) for i in (chunk_ids or []) if str(i).strip()]
+    if not ids:
+        return {}
+    ph = ",".join("?" for _ in ids)
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT chunk_id, COUNT(*) AS n FROM triplets WHERE company_id=?"
+            f" AND chunk_id IN ({ph}) GROUP BY chunk_id",
+            [company_id, *ids],
+        ).fetchall()
+        return {int(r["chunk_id"]): int(r["n"]) for r in rows}
+
+
+def sources_fully_covered(company_id: int, chunks: list[dict]) -> set[tuple[str, str]]:
+    """返回被选中 chunk 完整覆盖的 (snapshot_id, source_url) 集合。
+
+    只有整源被选中时才允许顺带清理「没有 chunk_id 的历史三元组」，
+    否则会误删同来源其他分块的数据。
+    """
+    if not chunks:
+        return set()
+    groups: dict[tuple[str, str], set[int]] = {}
+    for c in chunks:
+        groups.setdefault(
+            (str(c["snapshot_id"]), str(c["source_url"] or "")), set()
+        ).add(int(c["chunk_id"]))
+    covered: set[tuple[str, str]] = set()
+    with connect() as conn:
+        for (sid, url), sel in groups.items():
+            total = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM chunks WHERE company_id=? AND snapshot_id=?"
+                    " AND COALESCE(source_url,'')=?",
+                    (company_id, sid, url),
+                ).fetchone()["n"]
+            )
+            if total and total == len(sel):
+                covered.add((sid, url))
+    return covered
+
+
+def replace_chunk_triplets(
+    company_id: int,
+    chunk: dict,
+    rows: list[dict],
+    purge_null_source: bool = False,
+) -> dict:
+    """原子替换某个 chunk 的三元组：删除旧数据 + 写入新数据在同一个事务里。
+
+    rows 由调用方构造（已含 src_ekey/dst_ekey 等），字段：
+      snapshot_id, crawl_time, src_ekey, dst_ekey, src_name, dst_name,
+      src_type, dst_type, relation, props, source_url, source_title, source_kind, chunk_id
+
+    任何一步失败都整体回滚 —— 旧数据不会被删掉（这是「重新抽取把数据抽没了」的修复点）。
+    """
+    cid = int(chunk["chunk_id"])
+    sid = str(chunk["snapshot_id"])
+    url = str(chunk["source_url"] or "")
+    inserted = len(rows)
+    deleted = 0
+    with _lock, connect() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "DELETE FROM triplets WHERE company_id=? AND chunk_id=?", (company_id, cid)
+            )
+            deleted += int(cur.rowcount or 0)
+            if purge_null_source:
+                cur = conn.execute(
+                    "DELETE FROM triplets WHERE company_id=? AND snapshot_id=?"
+                    " AND COALESCE(source_url,'')=? AND chunk_id IS NULL",
+                    (company_id, sid, url),
+                )
+                deleted += int(cur.rowcount or 0)
+            conn.executemany(
+                "INSERT INTO triplets(company_id, snapshot_id, crawl_time, src_ekey, dst_ekey,"
+                " src_name, dst_name, src_type, dst_type, relation, props_json,"
+                " source_url, source_title, source_kind, chunk_id, created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        company_id,
+                        str(r.get("snapshot_id") or sid),
+                        str(r.get("crawl_time") or now_iso()),
+                        r["src_ekey"],
+                        r["dst_ekey"],
+                        r.get("src_name", ""),
+                        r.get("dst_name", ""),
+                        r.get("src_type", ""),
+                        r.get("dst_type", ""),
+                        r["relation"],
+                        json.dumps(r.get("props") or {}, ensure_ascii=False),
+                        r.get("source_url", url),
+                        r.get("source_title", ""),
+                        r.get("source_kind", "page"),
+                        int(r.get("chunk_id") or cid),
+                        now_iso(),
+                    )
+                    for r in rows
+                ],
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return {"inserted": inserted, "deleted": deleted}
+
+
+def delete_triplets_for_chunks(company_id: int, chunks: list[dict]) -> int:
+    """删除选中 chunk 产出的三元组（旧实现，仅为兼容保留；重新抽取已改走原子替换）。
+
+    兼容历史数据：早期三元组没有 chunk_id（NULL）。若选中的 chunk 已覆盖某个
+    (snapshot_id, source_url) 下的全部分块，则把该来源下 chunk_id 为 NULL 的旧三元组
+    一并删除，避免重新抽取后新旧两套并存、图谱写重。
+    """
+    if not chunks:
+        return 0
+    ids = [int(c["chunk_id"]) for c in chunks]
+    ph = ",".join("?" for _ in ids)
+    deleted = 0
+    with _lock, connect() as conn:
+        cur = conn.execute(
+            f"DELETE FROM triplets WHERE company_id=? AND chunk_id IN ({ph})",
+            [company_id, *ids],
+        )
+        deleted += int(cur.rowcount or 0)
+
+        # 覆盖整源时清理无 chunk_id 的历史三元组
+        groups: dict[tuple[str, str], list[int]] = {}
+        for c in chunks:
+            groups.setdefault((str(c["snapshot_id"]), str(c["source_url"] or "")), []).append(
+                int(c["chunk_id"])
+            )
+        for (sid, url), sel_ids in groups.items():
+            total = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM chunks WHERE company_id=? AND snapshot_id=?"
+                    " AND COALESCE(source_url,'')=?",
+                    (company_id, sid, url),
+                ).fetchone()["n"]
+            )
+            if total == 0 or total != len(set(sel_ids)):
+                continue  # 只抽了该来源的一部分分块：无法归属的历史三元组不动
+            cur = conn.execute(
+                "DELETE FROM triplets WHERE company_id=? AND snapshot_id=?"
+                " AND COALESCE(source_url,'')=? AND chunk_id IS NULL",
+                (company_id, sid, url),
+            )
+            deleted += int(cur.rowcount or 0)
+    return deleted
+
+
+def delete_orphan_entities(company_id: int, keep_ekeys: list[str] | None = None) -> int:
+    """删除不再被任何三元组引用的实体（重新抽取后残留的拼接实体等）。"""
+    keep = [str(k) for k in (keep_ekeys or []) if k]
+    with _lock, connect() as conn:
+        rows = conn.execute(
+            "SELECT ekey FROM entities WHERE company_id=?"
+            " AND ekey NOT IN (SELECT src_ekey FROM triplets WHERE company_id=?)"
+            " AND ekey NOT IN (SELECT dst_ekey FROM triplets WHERE company_id=?)",
+            (company_id, company_id, company_id),
+        ).fetchall()
+        targets = [r["ekey"] for r in rows if r["ekey"] not in keep]
+        if targets:
+            conn.executemany(
+                "DELETE FROM entities WHERE company_id=? AND ekey=?",
+                [(company_id, k) for k in targets],
+            )
+    return len(targets)
+
+
+def recount_snapshot_triplets(company_id: int, snapshot_id: str) -> int:
+    with _lock, connect() as conn:
+        n = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM triplets WHERE company_id=? AND snapshot_id=?",
+                (company_id, snapshot_id),
+            ).fetchone()["n"]
+        )
+        conn.execute(
+            "UPDATE snapshots SET triplet_count=? WHERE snapshot_id=?", (n, snapshot_id)
+        )
+    return n
+
+
+def snapshot_ids_of_company(company_id: int) -> list[str]:
+    with connect() as conn:
+        return [r["snapshot_id"] for r in conn.execute(
+            "SELECT snapshot_id FROM snapshots WHERE company_id=? ORDER BY crawl_time", (company_id,)
+        ).fetchall()]

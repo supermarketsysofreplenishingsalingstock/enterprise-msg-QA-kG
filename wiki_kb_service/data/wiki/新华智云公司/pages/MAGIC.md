@@ -1,16 +1,16 @@
 # MAGIC
 
-> 类型：VIDEO_PRODUCTION_PLATFORM
+> 类型：PRODUCT；出现过类型：VIDEO_PRODUCTION_PLATFORM
 
 ## 关系
 
 | 关系 | 对象 | 关系属性 | 快照 |
 | --- | --- | --- | --- |
-| ← HAS_PRODUCT | 新华智云 |  | snap_20261109_104330_3e0c |
+| ← PRODUCT | 新华智云 |  | snap_20261109_104330_3e0c |
 
 ## 来源
 
 - []()（2026-11-09T01:39:51.258Z）
 
 ---
-_更新时间：2026-11-09 11:33；来源：ingest 自动维护（ingest 与图谱关系分析一体完成）_
+_更新时间：2026-11-09 17:11；来源：ingest 自动维护（ingest 与图谱关系分析一体完成）_

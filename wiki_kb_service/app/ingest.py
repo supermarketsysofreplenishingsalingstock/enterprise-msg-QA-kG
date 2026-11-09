@@ -21,7 +21,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-from . import config, graph_store, wiki
+from . import config, graph_store, jobs, wiki
 from .extractor import chunk_text, extract_from_chunk, is_meaningful_triplet
 from .llm_factory import get_llm, config as cfg
 
@@ -118,6 +118,61 @@ def _excel_text(p: Path) -> str:
         return "（未安装 openpyxl，无法解析 excel 正文）"
 
 
+# ────────────────────────── 抽取 -> 入图（共用） ──────────────────────────
+
+async def _extract_chunk_to_graph(
+    *,
+    company_id: int,
+    snapshot_id: str,
+    crawl_time: str,
+    chunk_id: int | None,
+    text: str,
+    source_url: str,
+    source_title: str,
+    source_kind: str,
+    errors: list[str],
+) -> int:
+    """对单个 chunk 跑抽取并写入图谱（实体 upsert + 三元组），返回写入条数。
+
+    三元组带 chunk_id，便于「重新抽取选中的内容」时精确替换旧数据。
+    """
+    res = await extract_from_chunk(text or "")
+    if res.get("error"):
+        errors.append(f"chunk {chunk_id}: {res['error']}")
+        return 0
+    n = 0
+    for t in res["triplets"]:
+        if not is_meaningful_triplet(t):
+            continue
+        src_ekey = graph_store.upsert_entity(
+            company_id, t["head"], t["head_type"], t["head_props"], snapshot_id
+        )
+        dst_ekey = graph_store.upsert_entity(
+            company_id, t["tail"], t["tail_type"], t["tail_props"], snapshot_id
+        )
+        if not src_ekey or not dst_ekey:
+            continue
+        graph_store.insert_triplet(
+            company_id=company_id,
+            snapshot_id=snapshot_id,
+            crawl_time=crawl_time,
+            src_ekey=src_ekey,
+            dst_ekey=dst_ekey,
+            src_name=t["head"],
+            dst_name=t["tail"],
+            src_type=t["head_type"],
+            dst_type=t["tail_type"],
+            relation=t["relation"],
+            props={**t["relation_props"]},
+            source_url=source_url,
+            source_title=source_title,
+            source_kind=source_kind,
+            chunk_id=chunk_id,
+        )
+        n += 1
+    return n
+
+
 # ────────────────────────── Ingest 主流程 ──────────────────────────
 
 async def run_ingest(payload: dict) -> dict:
@@ -203,38 +258,17 @@ async def run_ingest(payload: dict) -> dict:
     errors: list[str] = []
     if do_extract:
         for cr in chunk_rows:
-            res = await extract_from_chunk(cr["text"])
-            if res.get("error"):
-                errors.append(f"chunk {cr['chunk_id']}: {res['error']}")
-                continue
-            for t in res["triplets"]:
-                if not is_meaningful_triplet(t):
-                    continue
-                src_ekey = graph_store.upsert_entity(
-                    company_id, t["head"], t["head_type"], t["head_props"], snapshot_id
-                )
-                dst_ekey = graph_store.upsert_entity(
-                    company_id, t["tail"], t["tail_type"], t["tail_props"], snapshot_id
-                )
-                if not src_ekey or not dst_ekey:
-                    continue
-                graph_store.insert_triplet(
-                    company_id=company_id,
-                    snapshot_id=snapshot_id,
-                    crawl_time=crawl_time,
-                    src_ekey=src_ekey,
-                    dst_ekey=dst_ekey,
-                    src_name=t["head"],
-                    dst_name=t["tail"],
-                    src_type=t["head_type"],
-                    dst_type=t["tail_type"],
-                    relation=t["relation"],
-                    props={**t["relation_props"]},
-                    source_url=cr["url"],
-                    source_title=cr["title"],
-                    source_kind=cr["kind"],
-                )
-                triplet_count += 1
+            triplet_count += await _extract_chunk_to_graph(
+                company_id=company_id,
+                snapshot_id=snapshot_id,
+                crawl_time=crawl_time,
+                chunk_id=cr["chunk_id"],
+                text=cr["text"],
+                source_url=cr["url"],
+                source_title=cr["title"],
+                source_kind=cr["kind"],
+                errors=errors,
+            )
 
     file_count = sum(1 for s in sources if s["kind"] == "file")
     page_count = sum(1 for s in sources if s["kind"] == "page")
@@ -284,8 +318,9 @@ async def run_ingest(payload: dict) -> dict:
 
 # ────────────────────────── 处理待抽取内容 ──────────────────────────
 
-async def run_process_pending(payload: dict) -> dict:
+async def run_process_pending(payload: dict, progress=None) -> dict:
     """处理指定公司尚未抽取的 chunk（图谱页「处理新增内容」按钮）。"""
+    _p = progress or (lambda **_kw: None)
     company_raw = str(payload.get("company") or "").strip()
     if not company_raw:
         raise ValueError("payload.company 不能为空")
@@ -313,42 +348,29 @@ async def run_process_pending(payload: dict) -> dict:
     triplet_count = 0
     errors: list[str] = []
     done_ids: list[int] = []
-    for cr in chunks:
-        crawl_time = str(cr.get("crawl_time") or graph_store.now_iso())
-        res = await extract_from_chunk(cr["text"] or "")
-        if res.get("error"):
-            errors.append(f"chunk {cr['chunk_id']}: {res['error']}")
-            continue  # 失败的 chunk 保持待处理，下次可重试
-        for t in res["triplets"]:
-            if not is_meaningful_triplet(t):
-                continue
-            src_ekey = graph_store.upsert_entity(
-                company_id, t["head"], t["head_type"], t["head_props"], cr["snapshot_id"]
-            )
-            dst_ekey = graph_store.upsert_entity(
-                company_id, t["tail"], t["tail_type"], t["tail_props"], cr["snapshot_id"]
-            )
-            if not src_ekey or not dst_ekey:
-                continue
-            graph_store.insert_triplet(
+    total = len(chunks)
+    async with jobs.EXTRACT_LOCK:
+        for i, cr in enumerate(chunks):
+            _p(done=i, total=total, stage="LLM 抽取中", current=f"chunk #{cr['chunk_id']}")
+            crawl_time = str(cr.get("crawl_time") or graph_store.now_iso())
+            err_before = len(errors)
+            n = await _extract_chunk_to_graph(
                 company_id=company_id,
                 snapshot_id=cr["snapshot_id"],
                 crawl_time=crawl_time,
-                src_ekey=src_ekey,
-                dst_ekey=dst_ekey,
-                src_name=t["head"],
-                dst_name=t["tail"],
-                src_type=t["head_type"],
-                dst_type=t["tail_type"],
-                relation=t["relation"],
-                props={**t["relation_props"]},
+                chunk_id=int(cr["chunk_id"]),
+                text=cr["text"] or "",
                 source_url=cr["source_url"],
                 source_title=cr["source_title"],
                 source_kind=cr["source_kind"],
+                errors=errors,
             )
-            triplet_count += 1
-        done_ids.append(int(cr["chunk_id"]))
+            if len(errors) > err_before:
+                continue  # 失败的 chunk 保持待处理，下次可重试
+            triplet_count += n
+            done_ids.append(int(cr["chunk_id"]))
 
+    _p(done=total, total=total, stage="重建 Wiki 页面", current="")
     graph_store.mark_chunks_processed(done_ids)
 
     # 快照三元组计数回填 + Wiki 重建
@@ -381,6 +403,234 @@ async def run_process_pending(payload: dict) -> dict:
         "wiki_pages_updated": wiki_stats["pages_written"],
         "remaining": graph_store.count_unprocessed_chunks(company_id),
         "extraction_errors": errors[:10],
+    }
+
+
+# ────────────────────────── 重新抽取（用户选中的已有内容） ──────────────────────────
+
+def _triplet_rows(
+    *,
+    company_id: int,
+    snapshot_id: str,
+    crawl_time: str,
+    chunk_id: int | None,
+    triplets: list[dict],
+    source_url: str,
+    source_title: str,
+    source_kind: str,
+) -> list[dict]:
+    """把抽取结果转成可直接写库的行（顺带 upsert 实体），不做任何删除动作。
+
+    同一 chunk 内 (src, dst, relation) 完全相同的重复三元组只保留第一条，
+    避免 LLM 对重复罗列的原文抽出重复边把图谱画乱（跨 chunk 的重复不算，
+    那是多来源佐证同一事实，属正常现象）。
+    """
+    rows: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for t in triplets:
+        if not is_meaningful_triplet(t):
+            continue
+        src_ekey = graph_store.upsert_entity(
+            company_id, t["head"], t["head_type"], t["head_props"], snapshot_id
+        )
+        dst_ekey = graph_store.upsert_entity(
+            company_id, t["tail"], t["tail_type"], t["tail_props"], snapshot_id
+        )
+        if not src_ekey or not dst_ekey:
+            continue
+        dedup_key = (str(src_ekey), str(dst_ekey), str(t["relation"]))
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        rows.append(
+            {
+                "snapshot_id": snapshot_id,
+                "crawl_time": crawl_time,
+                "src_ekey": src_ekey,
+                "dst_ekey": dst_ekey,
+                "src_name": t["head"],
+                "dst_name": t["tail"],
+                "src_type": t["head_type"],
+                "dst_type": t["tail_type"],
+                "relation": t["relation"],
+                "props": {**t["relation_props"]},
+                "source_url": source_url,
+                "source_title": source_title,
+                "source_kind": source_kind,
+                "chunk_id": chunk_id,
+            }
+        )
+    return rows
+
+
+async def run_reextract(payload: dict, progress=None) -> dict:
+    """对用户选中的 chunk 重新抽取 —— **非破坏式**。
+
+    关键顺序（这是「重新抽取把数据抽没了」的修复点）：
+      1. 先把所有选中分块跑完 LLM 抽取，结果只放在内存里，旧数据一条都不动；
+      2. 只有某个分块确实抽出了新三元组，才在**同一个事务**里删旧 + 插新；
+      3. 全部失败 → 直接报错，数据库保持原样；
+         某个分块抽成空 → 也保留旧数据（只记 warning），绝不出现「旧的没了新的没来」。
+    """
+    _p = progress or (lambda **_kw: None)
+    company_raw = str(payload.get("company") or "").strip()
+    if not company_raw:
+        raise ValueError("payload.company 不能为空")
+    company = graph_store.get_company_by_slug(graph_store.slugify(company_raw))
+    if not company:
+        raise ValueError(f"公司不存在：{company_raw}")
+    company_id = int(company["id"])
+    company_name = str(company["name"])
+    company_slug = str(company["slug"])
+
+    chunk_ids = [int(i) for i in (payload.get("chunk_ids") or []) if str(i).strip()]
+    if not chunk_ids:
+        raise ValueError("chunk_ids 不能为空（请在页面上勾选要重新抽取的内容）")
+
+    chunks = graph_store.get_chunks_by_ids(company_id, chunk_ids)
+    if not chunks:
+        raise ValueError("选中的内容不存在，或不属于该公司")
+    missing = sorted(set(chunk_ids) - {int(c["chunk_id"]) for c in chunks})
+
+    all_ids = [int(c["chunk_id"]) for c in chunks]
+    old_counts = graph_store.triplet_counts_by_chunk(company_id, all_ids)
+    covered = graph_store.sources_fully_covered(company_id, chunks)
+    total = len(chunks)
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    staged: list[tuple[dict, list[dict]]] = []
+
+    async with jobs.EXTRACT_LOCK:
+        # ── 阶段 1：只抽取，不写库 ──
+        for i, cr in enumerate(chunks):
+            cid = int(cr["chunk_id"])
+            _p(
+                done=i,
+                total=total,
+                stage="LLM 抽取中（旧数据尚未改动）",
+                current=f"chunk #{cid}",
+            )
+            res = await extract_from_chunk(cr["text"] or "")
+            if res.get("error"):
+                errors.append(f"chunk {cid}: {res['error']}")
+                continue
+            staged.append((cr, res["triplets"]))
+
+        if not staged:
+            _p(done=0, total=total, stage="全部失败，已保留原有数据")
+            raise ValueError(
+                "全部内容抽取失败，原有数据已完整保留（未删除任何三元组）。"
+                + (f"首个错误：{errors[0]}" if errors else "")
+            )
+
+        # ── 阶段 2：有结果才替换（同事务） ──
+        replaced_ids: list[int] = []
+        empty_kept: list[int] = []
+        attempted_ids: list[int] = []
+        new_total = 0
+        deleted_total = 0
+        for i, (cr, triplets) in enumerate(staged):
+            cid = int(cr["chunk_id"])
+            _p(
+                done=total - len(staged) + i,
+                total=total,
+                stage="写回图谱（同事务替换）",
+                current=f"chunk #{cid}",
+            )
+            sid = str(cr["snapshot_id"])
+            crawl_time = str(cr.get("crawl_time") or graph_store.now_iso())
+            rows = _triplet_rows(
+                company_id=company_id,
+                snapshot_id=sid,
+                crawl_time=crawl_time,
+                chunk_id=cid,
+                triplets=triplets,
+                source_url=cr["source_url"],
+                source_title=cr["source_title"],
+                source_kind=cr["source_kind"],
+            )
+            if not rows:
+                if old_counts.get(cid):
+                    # 新结果为空但旧数据有内容 → 保留旧数据，宁可不动
+                    empty_kept.append(cid)
+                    warnings.append(
+                        f"chunk {cid}: 本次抽取结果为空，已保留原有 {old_counts[cid]} 条三元组"
+                    )
+                else:
+                    attempted_ids.append(cid)
+                continue
+            info = graph_store.replace_chunk_triplets(
+                company_id,
+                cr,
+                rows,
+                purge_null_source=(sid, str(cr["source_url"] or "")) in covered,
+            )
+            deleted_total += int(info["deleted"])
+            new_total += int(info["inserted"])
+            replaced_ids.append(cid)
+
+    # ── 阶段 3：分块处理状态 + 孤立实体清理 + Wiki 重建 ──
+    graph_store.mark_chunks_processed([*replaced_ids, *attempted_ids, *empty_kept])
+    failed_ids = [
+        int(c["chunk_id"])
+        for c in chunks
+        if int(c["chunk_id"])
+        not in set(replaced_ids) | set(attempted_ids) | set(empty_kept)
+    ]
+    # 抽取失败的分块：有旧数据就保持「已处理」（数据还在），没数据才标回待处理
+    graph_store.mark_chunks_unprocessed([i for i in failed_ids if not old_counts.get(i)])
+    graph_store.mark_chunks_processed([i for i in failed_ids if old_counts.get(i)])
+    for i in failed_ids:
+        if old_counts.get(i):
+            warnings.append(f"chunk {i}: 抽取失败，已保留原有 {old_counts[i]} 条三元组")
+
+    # 只有在「全部成功且都有新数据」时才清孤立实体，避免失败分块的实体被误删
+    orphan_removed = 0
+    if not errors and not empty_kept:
+        orphan_removed = graph_store.delete_orphan_entities(
+            company_id, keep_ekeys=[graph_store.norm_ekey(company_name)]
+        )
+
+    for sid in {str(c["snapshot_id"]) for c in chunks}:
+        graph_store.recount_snapshot_triplets(company_id, sid)
+
+    _p(done=total, total=total, stage="重建 Wiki 页面", current="")
+    latest = graph_store.latest_snapshot_id(company_id) or str(chunks[0]["snapshot_id"])
+    wiki_stats = await regenerate_wiki_pages(
+        company_slug, company_name, company_id, latest, with_summary=not errors
+    )
+
+    wiki.append_log(
+        company_slug,
+        f"重新抽取：选中 chunk {len(chunks)} 个（替换成功 {len(replaced_ids)}），"
+        f"删除旧三元组 {deleted_total}，新抽取三元组 {new_total}，"
+        f"清理孤立实体 {orphan_removed}，更新实体页 {wiki_stats['pages_written']}"
+        + (
+            f"，清理失效页 {len(wiki_stats.get('pages_removed') or [])}"
+            if wiki_stats.get("pages_removed")
+            else ""
+        )
+        + (f"；抽取错误 {len(errors)} 条（旧数据已保留）" if errors else "")
+        + (f"；保留旧数据 {len(warnings)} 处" if warnings else ""),
+    )
+    wiki.rebuild_index(company_slug, company_name)
+
+    return {
+        "ok": True,
+        "company": company_name,
+        "company_slug": company_slug,
+        "chunk_count": len(replaced_ids),
+        "selected_chunks": len(chunks),
+        "deleted_triplets": deleted_total,
+        "triplet_count": new_total,
+        "orphan_entities_removed": orphan_removed,
+        "wiki_pages_updated": wiki_stats["pages_written"],
+        "remaining": graph_store.count_unprocessed_chunks(company_id),
+        "errors": errors[:10],
+        "warnings": warnings[:10],
+        "preserved_chunks": [*failed_ids, *empty_kept],
+        "missing_chunk_ids": missing,
     }
 
 
@@ -461,6 +711,59 @@ async def _llm_summary(company_name: str, entity: dict, relations: list[dict]) -
         return None
 
 
+def resolve_company_ekey(company_id: int, company_name: str) -> str:
+    """找到「公司主体」对应的实体键。
+
+    LLM 抽出的实体名常和公司记录名不完全一致（记录是「新华智云公司」，
+    抽出来的是「新华智云」）。直接用公司名查会查不到，公司总览页就变空白 ——
+    这里加一层回退：名称互为前缀的实体里，取度数（关系数）最高的那个。
+    """
+    target = graph_store.norm_ekey(company_name)
+    entities = graph_store.entities_for_company(company_id)
+    if not entities:
+        return target
+    if any(e["ekey"] == target for e in entities):
+        return target
+
+    name = str(company_name)
+    cands = [
+        e
+        for e in entities
+        if e["name"] and (name.startswith(str(e["name"])) or str(e["name"]).startswith(name))
+    ]
+    if not cands:
+        return target
+
+    deg: dict[str, int] = {}
+    with graph_store.connect() as conn:
+        for r in conn.execute(
+            "SELECT src_ekey AS k, COUNT(*) AS n FROM triplets WHERE company_id=? GROUP BY src_ekey",
+            (company_id,),
+        ):
+            deg[r["k"]] = deg.get(r["k"], 0) + int(r["n"])
+        for r in conn.execute(
+            "SELECT dst_ekey AS k, COUNT(*) AS n FROM triplets WHERE company_id=? GROUP BY dst_ekey",
+            (company_id,),
+        ):
+            deg[r["k"]] = deg.get(r["k"], 0) + int(r["n"])
+    cands.sort(key=lambda e: deg.get(e["ekey"], 0), reverse=True)
+    return str(cands[0]["ekey"])
+
+
+def _existing_summary(company_slug: str, page_name: str) -> str | None:
+    """读取已有页面里的「## 摘要」段。
+
+    重建页面时若这次没生成摘要（LLM 关了 / 抽取有错误 / 预算用完），就复用旧摘要 ——
+    避免重建一次就把历史摘要清空。
+    """
+    try:
+        text = wiki.read_page(company_slug, page_name) or ""
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.search(r"## 摘要\s*\n+(.+?)\n+## ", text, re.S)
+    return m.group(1).strip() if m else None
+
+
 async def regenerate_wiki_pages(
     company_slug: str,
     company_name: str,
@@ -484,7 +787,7 @@ async def regenerate_wiki_pages(
     pages_written = 0
 
     # 公司总览页
-    comp_ekey = graph_store.norm_ekey(company_name)
+    comp_ekey = resolve_company_ekey(company_id, company_name)
     comp_rel = _relations_of_entity(company_id, comp_ekey, None)
     comp_ent_row = next((e for e in entities if e["ekey"] == comp_ekey), None)
     comp_entity = {
@@ -497,6 +800,8 @@ async def regenerate_wiki_pages(
     summary = await _llm_summary(company_name, comp_entity, comp_rel) if with_summary else None
     if summary:
         summaries_done += 1
+    else:
+        summary = _existing_summary(company_slug, "_company")
     page_md = wiki.render_entity_page_markdown(comp_entity, comp_rel, summary)
     wiki.write_entity_page(company_slug, "_company", page_md)
     pages_written += 1
@@ -518,8 +823,19 @@ async def regenerate_wiki_pages(
             if summary:
                 summaries_done += 1
                 summary_budget -= 1
+        if not summary:
+            summary = _existing_summary(company_slug, e["name"])
         page_md = wiki.render_entity_page_markdown(entity_dict, rels, summary)
         wiki.write_entity_page(company_slug, e["name"], page_md)
         pages_written += 1
 
-    return {"pages_written": pages_written, "summaries": summaries_done}
+    # 清理"幽灵页"：图谱里已不存在的实体的旧页面（重抽变严/实体拆分后遗留）
+    removed_pages = wiki.remove_stale_pages(
+        company_slug, ["_company"] + [e["name"] for e in entities]
+    )
+
+    return {
+        "pages_written": pages_written,
+        "summaries": summaries_done,
+        "pages_removed": removed_pages,
+    }

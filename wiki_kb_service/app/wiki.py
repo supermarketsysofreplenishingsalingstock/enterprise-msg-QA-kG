@@ -160,6 +160,24 @@ def list_pages(company_slug: str) -> list[dict]:
     return out
 
 
+def remove_stale_pages(company_slug: str, keep_names: list[str]) -> list[str]:
+    """删除 pages/ 下不在 keep_names 里的实体页（图谱中已不存在的"幽灵页"）。
+
+    regenerate_wiki_pages 只按当前图谱实体"写"页面、从不"删"页面——
+    重抽/提示词变严后图谱里消失的实体会留下孤儿 .md，导致 Wiki 实体数
+    远多于图谱实体数。重建后调用本函数同步清理。返回被删除的文件名列表。
+    """
+    d = company_dir(company_slug) / "pages"
+    keep = {_safe_name(n, 40) + ".md" for n in keep_names}
+    keep.add(_safe_name("_company", 40) + ".md")
+    removed: list[str] = []
+    for p in sorted(d.glob("*.md")):
+        if p.name not in keep:
+            p.unlink()
+            removed.append(p.name)
+    return removed
+
+
 # ────────────────────────── index.md / log.md ──────────────────────────
 
 def rebuild_index(company_slug: str, company_name: str) -> Path:

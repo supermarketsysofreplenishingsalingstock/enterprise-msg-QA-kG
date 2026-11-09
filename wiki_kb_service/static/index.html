@@ -62,6 +62,22 @@
   .wiki-content a{color:#7fb0ff;text-decoration:none}
   .empty-hint{color:var(--muted);padding:40px;text-align:center;line-height:2}
   .loading{position:absolute;top:12px;left:14px;color:var(--muted);font-size:12px}
+  /* 重新抽取面板 */
+  .modal-mask{position:fixed;inset:0;background:rgba(6,10,16,.72);display:none;align-items:center;justify-content:center;z-index:50}
+  .modal{width:min(940px,94vw);max-height:86vh;background:var(--panel);border:1px solid var(--line);border-radius:10px;display:flex;flex-direction:column}
+  .modal-head{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:14px;color:#fff}
+  .modal-head .hint{display:block;font-size:12px;color:var(--muted);font-weight:400;margin-top:4px;line-height:1.6}
+  .modal-tools{padding:9px 16px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12.5px;color:var(--muted)}
+  .chunk-list{flex:1;overflow-y:auto;padding:4px 8px}
+  .chunk-item{display:flex;gap:10px;padding:9px 8px;border-bottom:1px solid var(--line);font-size:12.5px;align-items:flex-start;cursor:pointer}
+  .chunk-item:hover{background:var(--panel2)}
+  .chunk-item input{margin-top:3px}
+  .chunk-meta{color:var(--muted);font-size:11.5px;margin-bottom:4px;line-height:1.6}
+  .chunk-snip{color:#b9c7d6;line-height:1.55;word-break:break-all}
+  .badge{padding:1px 6px;border-radius:4px;font-size:11px;border:1px solid var(--line);color:var(--muted);margin-left:6px;white-space:nowrap}
+  .badge.warn{color:var(--warn);border-color:#5b4527}
+  .modal-foot{padding:10px 16px;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center}
+  .modal-foot .status{color:var(--muted);font-size:12.5px;margin-right:auto}
 </style>
 </head>
 <body>
@@ -88,6 +104,8 @@
     <input type="text" id="inpSearch" placeholder="搜索实体…" style="width:150px" />
     <button onclick="loadGraph()">刷新</button>
     <button id="btnPending" onclick="processPending()" title="抽取尚未处理的爬取内容（未勾选「自动抽取」时积累的内容在此补做）">处理新增内容</button>
+    <button id="btnReextract" onclick="openReextract()" title="勾选已有内容并重新抽取（抽取规则升级后刷新旧数据）">重新抽取…</button>
+    <span id="jobBadge" style="display:none;font-size:12px;padding:3px 8px;border:1px solid #5b4527;border-radius:5px;color:var(--warn);white-space:nowrap"></span>
   </div>
   <div class="tools" id="diffTools" style="display:none">
     <select id="selSnapA"></select>
@@ -115,6 +133,31 @@
     <div class="panel-body" id="detailBody"></div>
   </aside>
 </main>
+
+<div class="modal-mask" id="reextractModal">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        重新抽取选中的内容
+        <span class="hint">任务提交后在服务端后台运行，可以关闭页面或刷新，回来再看进度。为避免数据丢失：先跑完 LLM 抽取，只有确实抽出新结果时才替换旧三元组（同一事务）；抽取失败或结果为空时，原有数据保持不动。本地 LLM 较慢，每段约 3–8 分钟。</span>
+      </div>
+      <button onclick="closeReextract()">×</button>
+    </div>
+    <div class="modal-tools">
+      <button onclick="toggleAllChunks(true)">全选</button>
+      <button onclick="toggleAllChunks(false)">取消全选</button>
+      <span id="chunkCountLabel">0 条</span>
+      <span style="margin-left:auto"></span>
+      <select id="selChunkSnapshot" onchange="loadChunks()"><option value="all">全部快照</option></select>
+    </div>
+    <div class="chunk-list" id="chunkList"></div>
+    <div class="modal-foot">
+      <span class="status" id="reextractStatus"></span>
+      <button onclick="closeReextract()">关闭</button>
+      <button class="primary" id="btnDoReextract" onclick="doReextract()">开始重新抽取</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const API = "";
@@ -158,7 +201,100 @@ async function onCompanyChange(){
   selCat.innerHTML=`<option value="">全部类别</option>`+
     (catD.categories||[]).map(c=>`<option value="${esc(c.category)}">${esc(c.category)}（${c.count}）</option>`).join("");
   refreshPending();
+  checkRunningJob();
   loadGraph();
+}
+
+// ── 后台任务（服务端跑，关闭页面不影响）──
+let watchTimer=null, watchingJobId=null;
+function fmtElapsed(sec){
+  sec=Math.max(0,Math.floor(sec||0));
+  const m=Math.floor(sec/60), s=sec%60;
+  return m?`${m} 分 ${s} 秒`:`${s} 秒`;
+}
+function jobText(j){
+  const p=j.progress||{};
+  const st=j.status==="queued"?"排队中":(j.status==="running"?(p.stage||"运行中"):(j.status==="done"?"完成":"失败"));
+  const cnt=(p.total?`${p.done||0}/${p.total} · `:"");
+  const el=(j.status==="running"||j.status==="queued")?fmtElapsed((Date.now()/1000)-(j.started_at||j.created_at)):fmtElapsed(j.elapsed);
+  return `${j.kind==="reextract"?"重新抽取":"处理新增"}：${st} ${cnt}${el}`;
+}
+function updateJobBadge(j){
+  const b=document.getElementById("jobBadge");
+  if(!j){b.style.display="none";b.textContent="";return}
+  b.style.display="inline-block";
+  b.textContent=jobText(j);
+}
+function watchJob(jobId,onTick){
+  watchingJobId=jobId;
+  return new Promise((resolve,reject)=>{
+    if(!jobId||jobId==="undefined"){
+      watchingJobId=null;
+      reject(new Error("服务没有返回任务 ID——您连接的很可能是旧版服务（没有后台任务功能）。请重启 KB 服务（python run.py --force）并刷新页面后重试。"));
+      return;
+    }
+    let fails=0;
+    const poll=async()=>{
+      let j;
+      try{j=await getJSON(`${API}/api/jobs/${encodeURIComponent(jobId)}`);fails=0}
+      catch(e){
+        if(++fails>=10){
+          clearInterval(watchTimer);watchTimer=null;watchingJobId=null;
+          reject(new Error("查询任务进度连续失败，请确认 KB 服务是否仍在运行"));
+        }
+        return;
+      }
+      if(watchingJobId!==jobId)return;
+      if(onTick)onTick(j);
+      updateJobBadge(j);
+      if(j.status==="done"){
+        clearInterval(watchTimer);watchTimer=null;watchingJobId=null;
+        updateJobBadge(null);
+        resolve(j);
+      }else if(j.status==="error"){
+        clearInterval(watchTimer);watchTimer=null;watchingJobId=null;
+        updateJobBadge(null);
+        reject(new Error(j.error||"任务失败"));
+      }
+    };
+    if(watchTimer)clearInterval(watchTimer);
+    poll();
+    watchTimer=setInterval(poll,3000);
+  });
+}
+function jobSummary(j){
+  const r=j.result||{};
+  const lines=[];
+  if(j.kind==="reextract"){
+    lines.push(`选中 ${r.selected_chunks||0} 条，替换成功 ${r.chunk_count||0} 条`);
+    lines.push(`删除旧三元组 ${r.deleted_triplets||0}，写入新三元组 ${r.triplet_count||0}`);
+    if(r.orphan_entities_removed)lines.push(`清理孤立实体 ${r.orphan_entities_removed}`);
+    lines.push(`更新 Wiki 页 ${r.wiki_pages_updated||0}`);
+  }else{
+    lines.push(`处理 chunk ${r.chunk_count||0}，新增三元组 ${r.triplet_count||0}`);
+    lines.push(`更新 Wiki 页 ${r.wiki_pages_updated||0}`);
+    if(r.remaining)lines.push(`剩余待处理 ${r.remaining}`);
+  }
+  const msgs=[...(r.errors||[]),...(r.warnings||[])];
+  if(msgs.length)lines.push("","提示（原有数据已保留）：",...msgs.slice(0,3));
+  return lines.join("\n");
+}
+// 打开页面/切换公司时，接着盯上一次没看完的后台任务
+async function checkRunningJob(){
+  if(!currentCompany)return;
+  try{
+    const d=await getJSON(`${API}/api/jobs?company=${encodeURIComponent(currentCompany)}&limit=5`);
+    const j=(d.jobs||[]).find(x=>x.status==="running"||x.status==="queued");
+    if(j&&j.id!==watchingJobId){
+      updateJobBadge(j);
+      watchJob(j.id).then(async done=>{
+        alert("后台任务完成（"+done.company+"）\n\n"+jobSummary(done));
+        await onCompanyChange();
+      }).catch(e=>{updateJobBadge(null);alert("后台任务失败："+e.message)});
+    }else if(!j&&!watchingJobId){
+      updateJobBadge(null);
+    }
+  }catch(e){/* 忽略 */}
 }
 
 // ── 处理新增内容（补做未抽取的 chunk）──
@@ -177,7 +313,7 @@ async function processPending(){
   if(!currentCompany){alert("请先选择公司");return}
   const b=document.getElementById("btnPending");
   const old=b.textContent;
-  b.disabled=true;b.textContent="处理中…（调用 LLM 抽取，请稍候）";
+  b.disabled=true;b.textContent="已提交…";
   try{
     const r=await fetch(`${API}/api/process_pending`,{
       method:"POST",
@@ -186,18 +322,117 @@ async function processPending(){
     });
     const d=await r.json().catch(()=>null);
     if(!r.ok||!d||!d.ok)throw new Error((d&&d.detail)||("HTTP "+r.status));
-    if(d.chunk_count===0){alert(d.message||"没有待处理的内容")}
-    else{
-      const errs=(d.extraction_errors||[]).length?`\n\n抽取错误 ${d.extraction_errors.length} 条（失败内容保留待处理，可再次点击重试）：\n`+d.extraction_errors.slice(0,3).join("\n"):"";
-      alert(`处理完成：chunk ${d.chunk_count}，新增三元组 ${d.triplet_count}，更新 Wiki 页 ${d.wiki_pages_updated}`+(d.remaining?`，剩余待处理 ${d.remaining}`:"")+errs);
-    }
+    if(!d.pending){alert("没有待处理的内容");b.disabled=false;b.textContent=old;refreshPending();return}
+    b.textContent="后台处理中…";
+    const job=await watchJob(d.job_id,j=>{
+      const p=j.progress||{};
+      b.textContent=`后台处理中 ${p.done||0}/${p.total||0}`;
+    });
+    const res=job.result||{};
+    if(res.chunk_count===0)alert(res.message||"没有待处理的内容");
+    else alert("处理完成\n\n"+jobSummary(job));
     await onCompanyChange();
   }catch(e){alert("处理新增内容失败："+e.message)}
   finally{b.disabled=false;b.textContent=old;refreshPending()}
 }
 
-function fillDiffSelectors(snaps){
-  const opts=snaps.map(s=>`<option value="${esc(s.snapshot_id)}">${esc(s.snapshot_id)}（${fmtTs(s.crawl_time)}）</option>`).join("");
+// ── 重新抽取（用户勾选已有内容）──
+let chunkCache=[];
+async function openReextract(){
+  if(!currentCompany){alert("请先选择公司");return}
+  document.getElementById("reextractModal").style.display="flex";
+  try{
+    const d=await getJSON(`${API}/api/snapshots?company=${encodeURIComponent(currentCompany)}`);
+    const sel=document.getElementById("selChunkSnapshot");
+    sel.innerHTML=`<option value="all">全部快照</option>`+
+      (d.snapshots||[]).map(s=>`<option value="${esc(s.snapshot_id)}">${esc(s.snapshot_id)}（${fmtTs(s.crawl_time)}）</option>`).join("");
+  }catch(e){/* 快照列表失败不阻断 */}
+  loadChunks();
+}
+function closeReextract(){
+  // 任务已提交则跑在服务端，这里只是关面板，不影响后台
+  document.getElementById("reextractModal").style.display="none";
+}
+async function loadChunks(){
+  const box=document.getElementById("chunkList");
+  box.innerHTML=`<div class="empty-hint">加载中…</div>`;
+  try{
+    const snap=document.getElementById("selChunkSnapshot").value||"all";
+    const d=await getJSON(`${API}/api/chunks?company=${encodeURIComponent(currentCompany)}&snapshot=${encodeURIComponent(snap)}`);
+    chunkCache=d.chunks||[];
+  }catch(e){
+    chunkCache=[];
+    box.innerHTML=`<div class="empty-hint">加载失败：${esc(e.message)}</div>`;
+    updateChunkCount();return;
+  }
+  if(!chunkCache.length){
+    box.innerHTML=`<div class="empty-hint">该公司暂无可重新抽取的内容</div>`;
+    updateChunkCount();return;
+  }
+  box.innerHTML=chunkCache.map(c=>`
+    <label class="chunk-item">
+      <input type="checkbox" class="chunk-cb" value="${c.chunk_id}" onchange="updateChunkCount()">
+      <div>
+        <div class="chunk-meta">#${c.chunk_id} · ${esc(c.source_title||c.source_url||"未命名")} · 第 ${(c.ord||0)+1} 段 · ${c.text_len||0} 字 · ${esc(fmtTs(c.crawl_time))}
+          ${c.triplet_count?`<span class="badge">已产出 ${c.triplet_count} 条三元组</span>`
+            :(c.source_triplet_count?`<span class="badge warn">同来源旧数据 ${c.source_triplet_count} 条（重新抽取时整源替换）</span>`
+            :`<span class="badge">暂无三元组</span>`)}
+          ${c.processed?"":`<span class="badge warn">待抽取</span>`}
+        </div>
+        <div class="chunk-snip">${esc(c.snippet||"")}…</div>
+      </div>
+    </label>`).join("");
+  updateChunkCount();
+}
+function toggleAllChunks(on){
+  document.querySelectorAll(".chunk-cb").forEach(cb=>{cb.checked=!!on});
+  updateChunkCount();
+}
+function selectedChunkIds(){
+  return [...document.querySelectorAll(".chunk-cb:checked")].map(cb=>Number(cb.value));
+}
+function updateChunkCount(){
+  const n=selectedChunkIds().length;
+  document.getElementById("chunkCountLabel").textContent=`已选 ${n} / 共 ${chunkCache.length} 条`;
+  const b=document.getElementById("btnDoReextract");
+  if(!b.disabled)b.textContent=n?`开始重新抽取（${n} 条）`:"开始重新抽取";
+}
+async function doReextract(){
+  const ids=selectedChunkIds();
+  if(!ids.length){alert("请先勾选要重新抽取的内容");return}
+  if(!confirm(`将对选中的 ${ids.length} 条内容重新抽取：\n\n1) 先在服务端后台跑完 LLM 抽取（旧数据保持不动）\n2) 只有确实抽出新结果，才在同一个事务里替换这些内容的旧事实\n3) 抽取失败或结果为空 → 保留原有数据，不会出现"旧的没了新的也没来"\n4) 之后再重建 Wiki 页面\n\n任务提交后可以关闭页面或刷新，回来仍能看到进度。本地 LLM 较慢（每条 3–8 分钟）。继续？`))return;
+  const btn=document.getElementById("btnDoReextract");
+  const status=document.getElementById("reextractStatus");
+  btn.disabled=true;btn.textContent="提交中…";
+  status.textContent="正在提交任务…";
+  try{
+    const r=await fetch(`${API}/api/reextract`,{
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({company:currentCompany,chunk_ids:ids}),
+    });
+    const d=await r.json().catch(()=>null);
+    if(!r.ok||!d||!d.ok)throw new Error((d&&d.detail)||("HTTP "+r.status));
+    status.textContent="任务已在后台运行，可关闭本页面";
+    btn.textContent="后台运行中…";
+    const job=await watchJob(d.job_id,j=>{
+      const p=j.progress||{};
+      status.textContent=`${p.stage||"运行中"}${p.current?" · "+p.current:""} · ${p.done||0}/${p.total||0} · 已耗时 ${fmtElapsed((Date.now()/1000)-(j.started_at||j.created_at))}（可关闭页面）`;
+    });
+    alert("重新抽取完成\n\n"+jobSummary(job));
+    status.textContent="完成";
+    await loadChunks();
+    await onCompanyChange();
+  }catch(e){
+    status.textContent="失败";
+    alert("重新抽取失败："+e.message+"\n\n（原有数据未被删除）");
+  }finally{
+    btn.disabled=false;
+    updateChunkCount();
+  }
+}
+
+function fillDiffSelectors(snaps){  const opts=snaps.map(s=>`<option value="${esc(s.snapshot_id)}">${esc(s.snapshot_id)}（${fmtTs(s.crawl_time)}）</option>`).join("");
   document.getElementById("selSnapA").innerHTML=opts;
   document.getElementById("selSnapB").innerHTML=opts;
   const sa=document.getElementById("selSnapA"),sb=document.getElementById("selSnapB");

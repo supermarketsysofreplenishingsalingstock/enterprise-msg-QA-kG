@@ -9,8 +9,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from . import config, graph_service, graph_store, wiki
-from .ingest import run_ingest, run_process_pending
+from . import config, graph_service, graph_store, jobs, wiki
+from .ingest import run_ingest, run_process_pending, run_reextract
 from .llm_factory import llm_health
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -32,6 +32,90 @@ class IngestPayload(BaseModel):
 class ProcessPendingPayload(BaseModel):
     company: str = Field(..., description="公司名称或 slug")
     limit: int = Field(500, ge=1, le=2000)
+
+
+class ReextractPayload(BaseModel):
+    company: str = Field(..., description="公司名称或 slug")
+    chunk_ids: list[int] = Field(..., description="要重新抽取的 chunk id 列表")
+
+
+@app.get("/api/chunks")
+async def chunks(
+    company: str = Query(...),
+    snapshot: str | None = Query(None, description="快照 id；缺省/ all 表示全部"),
+    limit: int = Query(1000, ge=1, le=5000),
+):
+    """列出该公司可重新抽取的内容分块（图谱页「重新抽取」面板用）。"""
+    comp = graph_store.get_company_by_slug(_slug(company))
+    if not comp:
+        return {"company": company, "chunks": []}
+    return {
+        "company": str(comp["name"]),
+        "chunks": graph_store.list_chunks(int(comp["id"]), snapshot_id=snapshot, limit=limit),
+    }
+
+
+@app.post("/api/reextract")
+async def reextract(payload: ReextractPayload):
+    """对选中的已有内容重新抽取 —— 后台任务，立即返回 job_id。
+
+    * 旧数据只在新结果确实抽出来后才替换（同事务），失败不会丢数据；
+    * 任务跑在服务端，浏览器关掉/刷新都不影响，回来用 GET /api/jobs/{id} 查进度。
+    """
+    comp = graph_store.get_company_by_slug(_slug(payload.company))
+    if not comp:
+        raise HTTPException(status_code=400, detail=f"公司不存在：{payload.company}")
+    chunk_ids = [int(i) for i in payload.chunk_ids if str(i).strip()]
+    if not chunk_ids:
+        raise HTTPException(status_code=400, detail="chunk_ids 不能为空（请勾选要重新抽取的内容）")
+    chunks = graph_store.get_chunks_by_ids(int(comp["id"]), chunk_ids)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="选中的内容不存在，或不属于该公司")
+
+    running = jobs.running_for(str(comp["name"]))
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail=f"该公司已有任务在运行（{running['kind']}，已耗时 {int((running.get('elapsed') or 0))} 秒），请等它结束再提交",
+        )
+
+    job = jobs.spawn(
+        kind="reextract",
+        company=str(comp["name"]),
+        meta={"chunk_ids": [int(c["chunk_id"]) for c in chunks]},
+        total=len(chunks),
+        runner=lambda j: run_reextract(
+            {**payload.model_dump(), "company": str(comp["name"])},
+            progress=jobs.progress_setter(j),
+        ),
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "job_id": job["id"],
+            "status": job["status"],
+            "selected_chunks": len(chunks),
+            "message": "任务已在后台运行，可以关闭页面，稍后回来查看进度",
+        }
+    )
+
+
+@app.get("/api/jobs/{job_id}")
+async def job_detail(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在或服务已重启")
+    return job
+
+
+@app.get("/api/jobs")
+async def job_list(
+    company: str | None = Query(None),
+    kind: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+):
+    name = str(graph_store.get_company_by_slug(_slug(company))["name"]) if company else None
+    return {"jobs": jobs.list_jobs(company=name, kind=kind, limit=limit)}
 
 
 class DiffRequest(BaseModel):
@@ -73,14 +157,36 @@ async def pending(company: str = Query(...)):
 
 @app.post("/api/process_pending")
 async def process_pending(payload: ProcessPendingPayload):
-    """处理尚未抽取的内容（图谱页「处理新增内容」按钮）。"""
-    try:
-        result = await run_process_pending(payload.model_dump())
-        return JSONResponse(result)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"处理待抽取内容失败：{e}")
+    """处理尚未抽取的内容 —— 同样放进后台任务，关页面不影响。"""
+    comp = graph_store.get_company_by_slug(_slug(payload.company))
+    if not comp:
+        raise HTTPException(status_code=400, detail=f"公司不存在：{payload.company}")
+    running = jobs.running_for(str(comp["name"]))
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail=f"该公司已有任务在运行（{running['kind']}），请等它结束再提交",
+        )
+    pending_n = graph_store.count_unprocessed_chunks(int(comp["id"]))
+    job = jobs.spawn(
+        kind="process_pending",
+        company=str(comp["name"]),
+        meta={"limit": payload.limit},
+        total=pending_n,
+        runner=lambda j: run_process_pending(
+            {**payload.model_dump(), "company": str(comp["name"])},
+            progress=jobs.progress_setter(j),
+        ),
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "job_id": job["id"],
+            "status": job["status"],
+            "pending": pending_n,
+            "message": "任务已在后台运行，可以关闭页面，稍后回来查看进度",
+        }
+    )
 
 
 class ImportResultsPayload(BaseModel):
