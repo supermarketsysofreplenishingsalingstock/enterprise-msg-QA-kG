@@ -9,6 +9,7 @@ import { attachClarifySuggestions } from './clarification_hints'
 import { mergeFollowupTaskWithHistory, type TaskTurn } from './task_condense'
 import { applyManagerTaskHints, sanitizeIncomingTask } from './incoming_task'
 import { getExtractorAgentEnv } from './extractor_agent_env'
+import { extractCompanyNameFromTask } from '../services/companySiteResolver'
 import { buildExtractRunMeta, recordCrawlMetric, setRunMeta } from './crawl_metrics'
 import { recordRunLearningSignal } from './crawl_learning'
 import { buildRouteContextKey, recordChannelOutcomeFromRun } from './crawl_route_policy'
@@ -229,18 +230,35 @@ export async function executeExtractRun(params: ExecuteExtractParams) {
   runLightweightCuratorOnCrawlEnd()
 
   // ── 公司爬取：自动推送知识库 ingest（LLM Wiki + DynamicLLMPathExtractor 图谱一体完成）──
-  if (env.kbAutoIngest && ['ok', 'partial_ok'].includes(status) && (options as any).__companyCrawl === true) {
-    const companyName = String((options as any).__companyName ?? '').trim()
+  // 前端「爬取后自动抽取」开关 → options.__kbAutoIngest（默认 true）。
+  // 不勾选时仍会推送内容存为「待处理」（extract:false），可在图谱页点「处理新增内容」补做抽取。
+  // 兜底：即使不是公司流程（如直接给 URL 爬取），只要抓到了页面文本也推送入库，
+  // 公司名优先 options.__companyName，其次从任务文本识别，最后用首个页面的域名。
+  const kbPagesAll: any[] = Array.isArray(withMeta.kbPages) ? withMeta.kbPages : []
+  const isCompanyCrawl = (options as any).__companyCrawl === true
+  if (env.kbAutoIngest && ['ok', 'partial_ok'].includes(status) && (isCompanyCrawl || kbPagesAll.length)) {
+    let companyName = String((options as any).__companyName ?? '').trim()
+    if (!companyName) companyName = extractCompanyNameFromTask(String(withMeta.task ?? '')) ?? ''
+    if (!companyName) {
+      try {
+        const firstUrl = new URL(String(kbPagesAll[0]?.url ?? 'https://unknown'))
+        companyName = firstUrl.hostname.replace(/^www\./, '')
+      } catch {
+        companyName = '未命名公司'
+      }
+    }
     if (!companyName) {
       withMeta.meta = { ...withMeta.meta, kb_ingest: { ok: false, error: 'missing company name' } }
     } else {
+      const kbExtract = (options as any).__kbAutoIngest !== false
       try {
         const kbUrl = env.kbServiceUrl.replace(/\/$/, '')
         const kbPayload = {
           company: companyName,
           crawl_time: new Date().toISOString().slice(0, 19).replace('T', ' '),
           note: String(withMeta.task ?? '').slice(0, 200),
-          pages: Array.isArray(withMeta.kbPages) ? withMeta.kbPages : [],
+          extract: kbExtract,
+          pages: kbPagesAll,
           files: (Array.isArray(withMeta.attachments) ? withMeta.attachments : [])
             .filter((f: any) => f?.ok && f?.path)
             .map((f: any) => ({
@@ -255,7 +273,7 @@ export async function executeExtractRun(params: ExecuteExtractParams) {
           type: 'log',
           payload: {
             level: 'info',
-            message: `知识库：推送「${companyName}」爬取内容到 ${kbUrl}（页面 ${kbPayload.pages.length} / 文件 ${kbPayload.files.length}）`,
+            message: `知识库：推送「${companyName}」爬取内容到 ${kbUrl}（页面 ${kbPayload.pages.length} / 文件 ${kbPayload.files.length}，${kbExtract ? '自动抽取' : '存为待处理'}）`,
             ts: Date.now(),
           },
         })
@@ -269,19 +287,31 @@ export async function executeExtractRun(params: ExecuteExtractParams) {
         if (kbResp.ok && kbRes?.ok) {
           withMeta.meta = {
             ...withMeta.meta,
-            kb_ingest: {
-              ok: true,
-              snapshot_id: kbRes.snapshot_id,
-              triplets: kbRes.triplet_count,
-              wiki_pages: kbRes.wiki_pages_updated,
-              graph_ui: `${kbUrl}/`,
-            },
+            kb_ingest: kbExtract
+              ? {
+                  ok: true,
+                  mode: 'auto_extract',
+                  snapshot_id: kbRes.snapshot_id,
+                  triplets: kbRes.triplet_count,
+                  wiki_pages: kbRes.wiki_pages_updated,
+                  graph_ui: `${kbUrl}/`,
+                }
+              : {
+                  ok: true,
+                  mode: 'pending',
+                  snapshot_id: kbRes.snapshot_id,
+                  pending_chunks: kbRes.pending_chunks,
+                  note: '已存为待处理内容，请在图谱页点「处理新增内容」',
+                  graph_ui: `${kbUrl}/`,
+                },
           }
           emit?.({
             type: 'log',
             payload: {
               level: 'info',
-              message: `知识库：ingest 完成（快照 ${kbRes.snapshot_id}，三元组 ${kbRes.triplet_count}，实体页 ${kbRes.wiki_pages_updated}）；图谱界面 ${kbUrl}/`,
+              message: kbExtract
+                ? `知识库：ingest 完成（快照 ${kbRes.snapshot_id}，三元组 ${kbRes.triplet_count}，实体页 ${kbRes.wiki_pages_updated}）；图谱界面 ${kbUrl}/`
+                : `知识库：内容已存为待处理（chunk ${kbRes.pending_chunks}，未抽取）；在图谱页点「处理新增内容」完成抽取`,
               ts: Date.now(),
             },
           })

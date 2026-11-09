@@ -128,6 +128,11 @@ def init_db() -> None:
             );
             """
         )
+        # 旧库迁移：chunks.processed（1=已抽取，0=待处理；历史行视为已处理）
+        try:
+            conn.execute("ALTER TABLE chunks ADD COLUMN processed INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
 
 
 init_db()
@@ -401,14 +406,48 @@ def diff_snapshots(company_id: int, snap_a: str, snap_b: str) -> dict:
 
 # ────────────────────────── chunks / raw ──────────────────────────
 
-def insert_chunk(company_id: int, snapshot_id: str, source_url: str, source_title: str, source_kind: str, ord_: int, text: str) -> int:
+def insert_chunk(company_id: int, snapshot_id: str, source_url: str, source_title: str, source_kind: str, ord_: int, text: str, processed: int = 1) -> int:
     with _lock, connect() as conn:
         cur = conn.execute(
-            "INSERT INTO chunks(company_id, snapshot_id, source_url, source_title, source_kind, ord, text, created_at)"
-            " VALUES(?,?,?,?,?,?,?,?)",
-            (company_id, snapshot_id, source_url, source_title, source_kind, ord_, text, now_iso()),
+            "INSERT INTO chunks(company_id, snapshot_id, source_url, source_title, source_kind, ord, text, processed, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (company_id, snapshot_id, source_url, source_title, source_kind, ord_, text, processed, now_iso()),
         )
         return int(cur.lastrowid or 0)
+
+
+# ────────────────────────── 待处理 chunk（延迟抽取） ──────────────────────────
+
+def count_unprocessed_chunks(company_id: int) -> int:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM chunks WHERE company_id=? AND processed=0", (company_id,)
+        ).fetchone()
+        return int(row["n"] or 0)
+
+
+def get_unprocessed_chunks(company_id: int, limit: int = 500) -> list[dict]:
+    """待处理 chunk，附带所属快照的 crawl_time（写三元组来源时间用）。"""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT c.id AS chunk_id, c.company_id, c.snapshot_id, c.source_url, c.source_title,"
+            " c.source_kind, c.ord, c.text, COALESCE(s.crawl_time, '') AS crawl_time"
+            " FROM chunks c LEFT JOIN snapshots s ON s.snapshot_id = c.snapshot_id"
+            " WHERE c.company_id=? AND c.processed=0"
+            " ORDER BY c.created_at, c.ord LIMIT ?",
+            (company_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_chunks_processed(chunk_ids: list[int]) -> None:
+    if not chunk_ids:
+        return
+    with _lock, connect() as conn:
+        conn.executemany(
+            "UPDATE chunks SET processed=1 WHERE id=?",
+            [(int(i),) for i in chunk_ids],
+        )
 
 
 def insert_raw_source(company_id: int, snapshot_id: str, kind: str, url: str, title: str, path: str, crawl_time: str) -> None:

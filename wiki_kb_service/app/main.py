@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from . import config, graph_service, graph_store, wiki
-from .ingest import run_ingest
+from .ingest import run_ingest, run_process_pending
 from .llm_factory import llm_health
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -24,8 +24,14 @@ class IngestPayload(BaseModel):
     note: str | None = None
     snapshot_id: str | None = None
     dry_run: bool = False
+    extract: bool = Field(True, description="False 时只存原始内容（待处理），不做 LLM 抽取")
     pages: list[dict] = Field(default_factory=list, description="[{url,title,text?,html?,excerpt?}]")
     files: list[dict] = Field(default_factory=list, description="[{url,title,path,content_type,size}]")
+
+
+class ProcessPendingPayload(BaseModel):
+    company: str = Field(..., description="公司名称或 slug")
+    limit: int = Field(500, ge=1, le=2000)
 
 
 class DiffRequest(BaseModel):
@@ -51,6 +57,101 @@ async def ingest(payload: IngestPayload):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"ingest 失败：{e}")
+
+
+@app.get("/api/pending")
+async def pending(company: str = Query(...)):
+    """指定公司尚未抽取（待处理）的 chunk 数量。"""
+    comp = graph_store.get_company_by_slug(_slug(company))
+    if not comp:
+        return {"company": company, "pending": 0}
+    return {
+        "company": str(comp["name"]),
+        "pending": graph_store.count_unprocessed_chunks(int(comp["id"])),
+    }
+
+
+@app.post("/api/process_pending")
+async def process_pending(payload: ProcessPendingPayload):
+    """处理尚未抽取的内容（图谱页「处理新增内容」按钮）。"""
+    try:
+        result = await run_process_pending(payload.model_dump())
+        return JSONResponse(result)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"处理待抽取内容失败：{e}")
+
+
+class ImportResultsPayload(BaseModel):
+    """crawler_results.json（爬虫 Agent 的落盘结果）导入 KB。"""
+
+    results: dict = Field(..., description="crawler_results.json 的完整内容")
+    company: str | None = Field(None, description="公司名；缺省时从 task 文本识别，再退回域名")
+    extract: bool = Field(True, description="导入后是否立即抽取；False 则存为待处理")
+
+
+_COMPANY_PATTERNS = [
+    r"(?:爬取|抓取|采集|获取|分析)[：:]?\s*([^\s，。,,.：:]{2,24}?(?:公司|企业|集团|厂))[^，。]*官网?",
+    r"([^\s，。,,.：:]{2,20}?(?:公司|企业|集团))(?:的)?(?:官网|网站|主页|信息|资料)",
+]
+
+
+def _company_from_results(results: dict) -> str:
+    task = str(results.get("task") or "")
+    for p in _COMPANY_PATTERNS:
+        m = re.search(p, task)
+        if m:
+            return m.group(1).strip()
+    # 兜底：第一个 kbPage 的域名
+    kb = results.get("kbPages") or []
+    if kb:
+        url = str(kb[0].get("url") or "")
+        m = re.match(r"https?://(?:www\.)?([^/]+)", url)
+        if m:
+            return m.group(1)
+    return "未命名导入"
+
+
+@app.post("/api/import_results")
+async def import_results(payload: ImportResultsPayload):
+    """把爬虫 Agent 的 crawler_results.json 导入知识库（补齐未经公司流程的爬取）。"""
+    r = payload.results or {}
+    kb_pages = r.get("kbPages") or []
+    pages = [
+        {"url": p.get("url"), "title": p.get("title"), "text": p.get("text") or p.get("excerpt") or ""}
+        for p in kb_pages
+        if (p.get("text") or p.get("excerpt"))
+    ]
+    files = [
+        {
+            "url": f.get("url"),
+            "title": f.get("filename") or f.get("title"),
+            "path": f.get("path"),
+            "content_type": f.get("contentType"),
+            "size": f.get("size"),
+        }
+        for f in (r.get("attachments") or [])
+        if f.get("ok") and f.get("path")
+    ]
+    if not pages and not files:
+        raise HTTPException(status_code=400, detail="results 中没有可导入的 kbPages / attachments 内容")
+    ingest_payload = {
+        "company": (payload.company or "").strip() or _company_from_results(r),
+        "crawl_time": r.get("finishedAt") or r.get("startedAt"),
+        "note": str(r.get("task") or "")[:200],
+        "extract": payload.extract,
+        "pages": pages,
+        "files": files,
+    }
+    try:
+        result = await run_ingest(ingest_payload)
+        result["imported"] = {"pages": len(pages), "files": len(files)}
+        return JSONResponse(result)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"导入失败：{e}")
 
 
 @app.get("/api/companies")

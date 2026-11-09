@@ -130,6 +130,9 @@ async def run_ingest(payload: dict) -> dict:
     crawl_time = str(payload.get("crawl_time") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     note = str(payload.get("note") or "")
     dry_run = bool(payload.get("dry_run"))
+    # extract=False：只存原始资料 + chunk（标记待处理），不做 LLM 抽取；
+    # 之后可在图谱页点「处理新增内容」补做抽取。
+    do_extract = (not dry_run) and bool(payload.get("extract", True))
 
     company = graph_store.get_or_create_company(company_name)
     company_id = int(company["id"])
@@ -174,12 +177,16 @@ async def run_ingest(payload: dict) -> dict:
         p = wiki.save_raw_source(company_slug, snapshot_id, s["kind"], s["url"], s["title"], s["text"], crawl_time)
         graph_store.insert_raw_source(company_id, snapshot_id, s["kind"], s["url"], s["title"], str(p), crawl_time)
 
-    # 3) 分 chunk 登记
+    # 3) 分 chunk 登记（未抽取时标记 processed=0，供「处理新增内容」补做）
     chunk_rows: list[dict] = []
     ord_i = 0
+    chunk_processed_flag = 1 if do_extract else 0
     for s in sources:
         for piece in chunk_text(s["text"]):
-            cid = graph_store.insert_chunk(company_id, snapshot_id, s["url"], s["title"], s["kind"], ord_i, piece)
+            cid = graph_store.insert_chunk(
+                company_id, snapshot_id, s["url"], s["title"], s["kind"], ord_i, piece,
+                processed=chunk_processed_flag,
+            )
             chunk_rows.append(
                 {
                     "chunk_id": cid,
@@ -194,7 +201,7 @@ async def run_ingest(payload: dict) -> dict:
     # 4) 开放式抽取（不预设 schema；保留全部三元组；属性必提）
     triplet_count = 0
     errors: list[str] = []
-    if not dry_run:
+    if do_extract:
         for cr in chunk_rows:
             res = await extract_from_chunk(cr["text"])
             if res.get("error"):
@@ -235,15 +242,23 @@ async def run_ingest(payload: dict) -> dict:
         snapshot_id, page_count, file_count, len(chunk_rows), triplet_count
     )
 
-    # 5) Wiki 层更新（与图谱抽取同流程完成；dry_run 不调 LLM）
-    wiki_stats = await regenerate_wiki_pages(
-        company_slug, company_name, company_id, snapshot_id, with_summary=not dry_run
-    )
+    # 5) Wiki 层更新（与图谱抽取同流程完成；dry_run / 延迟抽取时不调 LLM）
+    if do_extract:
+        wiki_stats = await regenerate_wiki_pages(
+            company_slug, company_name, company_id, snapshot_id, with_summary=True
+        )
+    else:
+        wiki_stats = {"pages_written": 0, "summaries": 0}
 
     wiki.append_log(
         company_slug,
         f"ingest 快照 {snapshot_id}：来源 页面{page_count}/文件{file_count}，chunk {len(chunk_rows)}，"
-        f"新抽取三元组 {triplet_count}，更新实体页 {wiki_stats['pages_written']}；LLM={llm_desc}"
+        + (
+            f"新抽取三元组 {triplet_count}，更新实体页 {wiki_stats['pages_written']}"
+            if do_extract
+            else f"已存为待处理内容（未抽取，待处理 chunk {len(chunk_rows)}）"
+        )
+        + f"；LLM={llm_desc}"
         + (f"；抽取错误 {len(errors)} 条" if errors else ""),
     )
     wiki.rebuild_index(company_slug, company_name)
@@ -262,6 +277,110 @@ async def run_ingest(payload: dict) -> dict:
         "llm_summaries": wiki_stats["summaries"],
         "extraction_errors": errors[:10],
         "dry_run": dry_run,
+        "extracted": do_extract,
+        "pending_chunks": 0 if do_extract else len(chunk_rows),
+    }
+
+
+# ────────────────────────── 处理待抽取内容 ──────────────────────────
+
+async def run_process_pending(payload: dict) -> dict:
+    """处理指定公司尚未抽取的 chunk（图谱页「处理新增内容」按钮）。"""
+    company_raw = str(payload.get("company") or "").strip()
+    if not company_raw:
+        raise ValueError("payload.company 不能为空")
+    company = graph_store.get_company_by_slug(graph_store.slugify(company_raw))
+    if not company:
+        raise ValueError(f"公司不存在：{company_raw}")
+    company_id = int(company["id"])
+    company_name = str(company["name"])
+    company_slug = str(company["slug"])
+    limit = int(payload.get("limit") or 500)
+
+    chunks = graph_store.get_unprocessed_chunks(company_id, limit=limit)
+    if not chunks:
+        return {
+            "ok": True,
+            "company": company_name,
+            "company_slug": company_slug,
+            "chunk_count": 0,
+            "triplet_count": 0,
+            "wiki_pages_updated": 0,
+            "extraction_errors": [],
+            "message": "没有待处理的内容",
+        }
+
+    triplet_count = 0
+    errors: list[str] = []
+    done_ids: list[int] = []
+    for cr in chunks:
+        crawl_time = str(cr.get("crawl_time") or graph_store.now_iso())
+        res = await extract_from_chunk(cr["text"] or "")
+        if res.get("error"):
+            errors.append(f"chunk {cr['chunk_id']}: {res['error']}")
+            continue  # 失败的 chunk 保持待处理，下次可重试
+        for t in res["triplets"]:
+            if not is_meaningful_triplet(t):
+                continue
+            src_ekey = graph_store.upsert_entity(
+                company_id, t["head"], t["head_type"], t["head_props"], cr["snapshot_id"]
+            )
+            dst_ekey = graph_store.upsert_entity(
+                company_id, t["tail"], t["tail_type"], t["tail_props"], cr["snapshot_id"]
+            )
+            if not src_ekey or not dst_ekey:
+                continue
+            graph_store.insert_triplet(
+                company_id=company_id,
+                snapshot_id=cr["snapshot_id"],
+                crawl_time=crawl_time,
+                src_ekey=src_ekey,
+                dst_ekey=dst_ekey,
+                src_name=t["head"],
+                dst_name=t["tail"],
+                src_type=t["head_type"],
+                dst_type=t["tail_type"],
+                relation=t["relation"],
+                props={**t["relation_props"]},
+                source_url=cr["source_url"],
+                source_title=cr["source_title"],
+                source_kind=cr["source_kind"],
+            )
+            triplet_count += 1
+        done_ids.append(int(cr["chunk_id"]))
+
+    graph_store.mark_chunks_processed(done_ids)
+
+    # 快照三元组计数回填 + Wiki 重建
+    for sid in {c["snapshot_id"] for c in chunks}:
+        with graph_store.connect() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) AS n FROM triplets WHERE company_id=? AND snapshot_id=?",
+                (company_id, sid),
+            ).fetchone()
+            conn.execute(
+                "UPDATE snapshots SET triplet_count=? WHERE snapshot_id=?", (int(n["n"]), sid)
+            )
+    latest = graph_store.latest_snapshot_id(company_id) or chunks[0]["snapshot_id"]
+    wiki_stats = await regenerate_wiki_pages(company_slug, company_name, company_id, latest, with_summary=True)
+
+    wiki.append_log(
+        company_slug,
+        f"处理新增内容：抽取 chunk {len(done_ids)}/{len(chunks)}，新增三元组 {triplet_count}，"
+        f"更新实体页 {wiki_stats['pages_written']}"
+        + (f"；抽取错误 {len(errors)} 条（保留待处理，可重试）" if errors else ""),
+    )
+    wiki.rebuild_index(company_slug, company_name)
+
+    return {
+        "ok": True,
+        "company": company_name,
+        "company_slug": company_slug,
+        "chunk_count": len(done_ids),
+        "triplet_count": triplet_count,
+        "wiki_pages_updated": wiki_stats["pages_written"],
+        "remaining": graph_store.count_unprocessed_chunks(company_id),
+        "extraction_errors": errors[:10],
     }
 
 

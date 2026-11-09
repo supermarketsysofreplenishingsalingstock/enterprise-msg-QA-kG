@@ -202,6 +202,9 @@ def get_extractor() -> DynamicLLMPathExtractor:
             allowed_relation_props=config.resolve_props_mode(),
             # 宽松解析：不丢弃任何能解析出的三元组
             parse_fn=lenient_parse_fn_with_props,
+            # 关键：默认 False 会把 LLM 调用异常（如连不上）吞掉并返回 0 三元组，
+            # 导致分块被误标"已处理"。改为 True 让错误上抛，待处理分块保留可重试。
+            raise_on_error=True,
         )
     return _extractor_instance
 

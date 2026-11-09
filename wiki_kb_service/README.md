@@ -89,3 +89,25 @@ data/
     index.md               # 内容目录
     log.md                 # 时间线日志
 ```
+
+## 延迟抽取 / 待处理机制（2026-11-09 新增）
+
+爬虫端「爬取后自动抽取」开关不勾选时，内容仍会推送到 KB 服务，但**只存原始资料 + chunk（标记待处理），不做 LLM 抽取**。之后在图谱页点「处理新增内容」补做。
+
+### 相关 API
+
+| 端点 | 说明 |
+|---|---|
+| `POST /api/ingest` | 新增字段 `extract`（默认 `true`）。`false` 时只存待处理内容 |
+| `GET /api/pending?company=` | 返回 `{pending: n}`——该公司尚未抽取的 chunk 数 |
+| `POST /api/process_pending` | body `{company, limit?}`，处理全部待处理 chunk：抽取三元组 → 入库 → 重建 Wiki → 回填快照计数。抽取失败的 chunk 保留待处理状态，可重试 |
+
+### 图谱页按钮
+
+工具栏「处理新增内容」按钮：显示当前公司待处理数量（如「处理新增内容（12 条待抽取）」，有待处理时高亮）；点击后调用 LLM 抽取并刷新图谱。
+
+### 测试
+
+```bash
+python test_pending.py   # mock LLM 全链路：extract=false 入库 → process_pending → 图谱/Wiki 校验
+```

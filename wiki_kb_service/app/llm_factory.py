@@ -74,10 +74,12 @@ _llm_instance: ThinkStripLLM | None = None
 def build_llm() -> ThinkStripLLM:
     profile = config.get_llm_profile()
     api_key = profile.get("api_key") or "not-needed"
+    # 关键：llama_index OpenAI/OpenAILike 的端点参数名是 api_base（不是 base_url）。
+    # base_url 会被落入 **kwargs 被忽略，客户端回落到 https://api.openai.com → Connection error。
     return ThinkStripLLM(
         model=profile["model"],
         api_key=api_key,
-        base_url=profile["base_url"],
+        api_base=str(profile["base_url"]),
         is_chat_model=True,
         is_function_calling_model=False,
         temperature=config.LLM_TEMPERATURE,

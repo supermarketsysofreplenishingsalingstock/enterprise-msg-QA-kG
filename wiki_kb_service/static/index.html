@@ -87,6 +87,7 @@
     </select>
     <input type="text" id="inpSearch" placeholder="搜索实体…" style="width:150px" />
     <button onclick="loadGraph()">刷新</button>
+    <button id="btnPending" onclick="processPending()" title="抽取尚未处理的爬取内容（未勾选「自动抽取」时积累的内容在此补做）">处理新增内容</button>
   </div>
   <div class="tools" id="diffTools" style="display:none">
     <select id="selSnapA"></select>
@@ -156,7 +157,43 @@ async function onCompanyChange(){
   const selCat=document.getElementById("selCategory");
   selCat.innerHTML=`<option value="">全部类别</option>`+
     (catD.categories||[]).map(c=>`<option value="${esc(c.category)}">${esc(c.category)}（${c.count}）</option>`).join("");
+  refreshPending();
   loadGraph();
+}
+
+// ── 处理新增内容（补做未抽取的 chunk）──
+async function refreshPending(){
+  if(!currentCompany)return;
+  const b=document.getElementById("btnPending");
+  try{
+    const d=await getJSON(`${API}/api/pending?company=${encodeURIComponent(currentCompany)}`);
+    const n=d.pending||0;
+    b.textContent=n?`处理新增内容（${n} 条待抽取）`:"处理新增内容";
+    b.style.fontWeight=n?"700":"";
+    b.style.color=n?"var(--accent,#f0a132)":"";
+  }catch(e){/* 静默 */}
+}
+async function processPending(){
+  if(!currentCompany){alert("请先选择公司");return}
+  const b=document.getElementById("btnPending");
+  const old=b.textContent;
+  b.disabled=true;b.textContent="处理中…（调用 LLM 抽取，请稍候）";
+  try{
+    const r=await fetch(`${API}/api/process_pending`,{
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({company:currentCompany}),
+    });
+    const d=await r.json().catch(()=>null);
+    if(!r.ok||!d||!d.ok)throw new Error((d&&d.detail)||("HTTP "+r.status));
+    if(d.chunk_count===0){alert(d.message||"没有待处理的内容")}
+    else{
+      const errs=(d.extraction_errors||[]).length?`\n\n抽取错误 ${d.extraction_errors.length} 条（失败内容保留待处理，可再次点击重试）：\n`+d.extraction_errors.slice(0,3).join("\n"):"";
+      alert(`处理完成：chunk ${d.chunk_count}，新增三元组 ${d.triplet_count}，更新 Wiki 页 ${d.wiki_pages_updated}`+(d.remaining?`，剩余待处理 ${d.remaining}`:"")+errs);
+    }
+    await onCompanyChange();
+  }catch(e){alert("处理新增内容失败："+e.message)}
+  finally{b.disabled=false;b.textContent=old;refreshPending()}
 }
 
 function fillDiffSelectors(snaps){
@@ -356,14 +393,26 @@ document.getElementById("selLimit").addEventListener("change",loadGraph);
 document.getElementById("inpSearch").addEventListener("input",debounce(loadGraph,400));
 
 // ── 与爬虫工作台的互通导航 ──
-// ?crawler=<url>  自定义爬虫工作台地址（默认 http://127.0.0.1:13104）
+// ?crawler=<url>  自定义爬虫工作台地址（默认自动探测 127.0.0.1 / localhost:13104）
 // ?embed=1        表示当前处于爬虫工作台的 iframe 内，隐藏返回链接（避免嵌套跳转）
 (function(){
   const q=new URLSearchParams(location.search);
   const link=document.getElementById("crawlerLink");
   if(q.get("embed")==="1"){link.style.display="none";return}
-  link.href=(q.get("crawler")||"http://127.0.0.1:13104").trim();
+  const CANDIDATES=[...(new Set([(q.get("crawler")||"").trim(),"http://127.0.0.1:13104","http://localhost:13104"].filter(Boolean)))];
+  link.href=CANDIDATES[0];
   link.target="_top"; // iframe 内也能直接跳出
+  // 点击时自动探测哪个地址可达（dev server 可能只监听 IPv6 或 IPv4 之一）
+  link.addEventListener("click",e=>{
+    e.preventDefault();
+    const tryOne=i=>{
+      if(i>=CANDIDATES.length){location.href=CANDIDATES[0];return} // 都探测失败就按默认跳
+      fetch(CANDIDATES[i],{mode:"no-cors",signal:AbortSignal.timeout(2500)})
+        .then(()=>{location.href=CANDIDATES[i]})
+        .catch(()=>tryOne(i+1));
+    };
+    tryOne(0);
+  });
 })();
 
 loadCompanies();

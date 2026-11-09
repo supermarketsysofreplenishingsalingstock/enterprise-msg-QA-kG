@@ -150,6 +150,10 @@
               <input v-model="collectAttachments" type="checkbox" />
               下载站内挂载文件（PDF / DOCX / XLSX 等）
             </label>
+            <label class="company-check" title="勾选：爬取完成后立即自动抽取关系/属性并更新图谱与 Wiki；不勾选：内容先存为待处理，之后在图谱页点「处理新增内容」">
+              <input v-model="kbAutoExtract" type="checkbox" />
+              爬取后自动抽取（知识库 / 图谱）
+            </label>
             <button type="button" class="btn btn-secondary btn-small" @click="goKbUi">
               知识库 / 图谱界面
             </button>
@@ -739,6 +743,8 @@ const canSendFeedback = computed(() => {
 const companyName = ref('')
 const companyTraits = ref('')
 const collectAttachments = ref(true)
+// 爬取后是否自动抽取（不勾选时内容仍会存入知识库为「待处理」，可在图谱页手动处理）
+const kbAutoExtract = ref(true)
 const companySearching = ref(false)
 const companyCandidates = ref<any[]>([])
 const companySearchMessage = ref('')
@@ -821,6 +827,7 @@ function startCompanyCrawl(crawlAll: boolean) {
   ;(options as any).companyName = name
   ;(options as any).companyTraits = traits
   ;(options as any).collectAttachments = collectAttachments.value
+  ;(options as any).__kbAutoIngest = kbAutoExtract.value
   ;(options as any).siteCrawl = true
   ;(options as any).maxPages = Math.max(Number(options.maxPages ?? 0), 8)
   ;(options as any).maxDepth = Math.max(Number(options.maxDepth ?? 0), 2)
