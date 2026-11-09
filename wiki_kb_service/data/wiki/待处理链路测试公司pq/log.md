@@ -10,3 +10,6 @@
 - [2026-11-09 18:41:36] ingest 快照 snap_20261109_184136_395b：来源 页面2/文件0，chunk 2，已存为待处理内容（未抽取，待处理 chunk 2）；LLM={"provider": "local_deepseek", "model": "deepseek-r1:14b", "base_url": "http://localhost:11434/v1"}
 - [2026-11-09 18:41:36] 处理新增内容：抽取 chunk 2/2，新增三元组 4，更新实体页 3
 - [2026-11-09 18:41:36] ingest 快照 snap_20261109_184136_87bf：来源 页面2/文件0，chunk 2，新抽取三元组 4，更新实体页 3；LLM={"provider": "local_deepseek", "model": "deepseek-r1:14b", "base_url": "http://localhost:11434/v1"}
+- [2026-11-09 19:31:31] ingest 快照 snap_20261109_193131_e30a：来源 页面2/文件0，chunk 2，已存为待处理内容（未抽取，待处理 chunk 2）；LLM={"provider": "local_deepseek", "model": "deepseek-r1:14b", "base_url": "http://localhost:11434/v1"}
+- [2026-11-09 19:31:31] 处理新增内容：抽取 chunk 2/2，新增三元组 4，更新实体页 3
+- [2026-11-09 19:31:31] ingest 快照 snap_20261109_193131_d2d0：来源 页面2/文件0，chunk 2，新抽取三元组 4，更新实体页 3；LLM={"provider": "local_deepseek", "model": "deepseek-r1:14b", "base_url": "http://localhost:11434/v1"}

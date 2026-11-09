@@ -47,13 +47,23 @@ _ENTITY_GRANULARITY_RULES = """
 ENTITY GRANULARITY RULES（实体粒度规则，优先级最高）:
 - 一个实体名只能指一个实体。中文里出现「A和B」「A与B」「A、B」「A及B」「A以及B」这类并列结构时，先判断 A、B 是否各自都能独立指代现实中的不同对象（不同公司、机构、组织、人物、产品、项目、地区）。
 - 若可以独立指代 —— 必须拆成多个独立实体，每个实体单独生成一条三元组，绝不允许把并列项拼成一个实体名。
-  错误示范（禁止）: head='新华智云', relation='INVESTED_BY', tail='国家通讯社和阿里巴巴集团'
-  正确示范: [{{'head': '新华智云', 'relation': 'INVESTED_BY', 'tail': '新华通讯社'}}, {{'head': '新华智云', 'relation': 'INVESTED_BY', 'tail': '阿里巴巴集团'}}]
+  错误示范（禁止）: head='新华智云', relation='投资方', tail='国家通讯社和阿里巴巴集团'
+  正确示范: [{{'head': '新华智云', 'relation': '投资方', 'tail': '新华通讯社'}}, {{'head': '新华智云', 'relation': '投资方', 'tail': '阿里巴巴集团'}}]
 - 若并列项其实指向同一个实体 —— 不要拆分，仍然把并列的写法整体保留为一个实体名。典型情形：
   ① 「和/与/及」不是并列连词，而是专有名称本身的一部分（如「和平饭店」「协和医院」「和记黄埔」「共和银行」）；
   ② 并列项是同一实体的全称与简称、正式名与别称并置（如「新华通讯社（国家通讯社）」「阿里巴巴集团（阿里）」）；
   ③ 并列项合起来才构成一个不可分割的唯一指代对象（如「中国银行保险监督管理委员会」「国务院国资委」等法定机构全称）。
-- 别名处理：同一实体有简称/别称时，实体名统一使用最正式完整的名称，别称写进该实体的属性 alias。同一实体在所有三元组中名称必须完全一致（不要一处「阿里巴巴集团」、另一处「阿里」）。
+- 别名处理：同一实体有简称/别称时，实体名统一使用最正式完整的名称，别称写进该实体的属性「别名」。同一实体在所有三元组中名称必须完全一致（不要一处「阿里巴巴集团」、另一处「阿里」）。
+"""
+
+# 命名语言规则：用户要求关系名、实体类型名、属性名全部使用中文，
+# 便于图谱与 Wiki 直接阅读；禁止输出 INVESTED_BY 这类英文大写关系名。
+_NAMING_LANGUAGE_RULES = """
+NAMING LANGUAGE RULES（命名语言规则，强制）:
+- 关系名（relation）一律用中文，2–6 字，名词或动宾短语均可。常用参考：投资方、开发了、推出了、提供、所属领域、采用技术、重点方向、公司性质、标签、口号、愿景、价值观、获奖、资质、位于、成立于、覆盖区域、顺应趋势、布局、合作伙伴、客户、服务对象、隶属于、合作。禁止输出 INVESTED_BY、HAS_AWARD 这类英文大写关系名。
+- 实体类型（head_type / tail_type）一律用中文，如：公司、机构、人物、产品、技术、领域、奖项、资质、标签、口号、理念、地点、日期、概念。
+- 属性名（属性对象里的 key）一律用中文，如：成立时间、注册资本、法定代表人、官网、别名、定位、简介、创始人。
+- 上面列出的关系名只是常用参考，允许自由归纳更贴切的中文关系名，但必须是中文。
 """
 
 # 信息完备性规则：粒度规则只约束"怎么命名/拆分"，绝不等于"少抽"。
@@ -61,26 +71,30 @@ ENTITY GRANULARITY RULES（实体粒度规则，优先级最高）:
 # 都是高价值信息，必须积极抽成 实体+关系，宁可多不可漏。
 _COMPREHENSIVENESS_RULES = """
 COMPREHENSIVENESS RULES（信息完备性规则，与粒度规则同等重要）:
-上面的粒度规则只约束「实体怎么命名、怎么拆分」，绝不意味着要少抽。公司官网里的定位语、口号、业务领域、技术方向、性质标签都是高价值信息，必须积极抽取成 实体+关系，宁多勿漏：
-1. 公司性质与标签：「国有控股传播科技公司」「国家高新技术企业」「国内AIGC领军企业」这类定位描述必须抽取。所有权性质（国有控股/民营/合资/央企背景）单独作为实体（类型可用「标签」），relation 用 COMPANY_NATURE；行业/能力标签（如「传播科技」「高新技术企业」「领军企业」）用 HAS_TAG。按粒度规则，一个标签一个实体，不要把整句定位语拼成一个实体名。
-2. 口号/愿景/使命/价值观：网站标语、愿景宣言、价值观词汇（例如「赋万物为媒」「迎智能时代」「整合全球数据达到人人可用」「利他之心」）都要抽取，relation 用 HAS_SLOGAN（口号）、HAS_VISION（愿景）、HAS_VALUE（价值观），实体类型可用「口号」或「理念」。
-3. 业务领域与泛概念：只要一个概念被用来描述公司的业务、行业、产品方向或技术底座——例如「大数据」「大模型」「AIGC」「数字人」「媒体融合」「智能传播」——即使它是泛概念也必须抽成实体（类型可用「领域」或「技术」），relation 用 OPERATES_IN（所属行业/领域）、USES_TECH（采用的技术）、FOCUS_ON（重点布局的方向）。泛概念不允许作为 INVESTED_BY、OWNED_BY 这类事实型关系的客体，但作为上述属性型关系的客体完全正确。
-4. 趋势与新方向：「顺应XX趋势」「拥抱XX」「布局XX赛道」「深耕XX领域」——这类表述说明公司的战略动向，必须抽：FOLLOWS_TREND（顺应的趋势）、EXPANDS_INTO（新进入的领域）。
-5. 地点与时间：公司所在地、注册地、覆盖区域（国家/省/市都算，relation 用 LOCATED_IN / COVERS_REGION）；成立时间、上线时间（FOUNDED_IN / LAUNCHED_IN）。
-6. 合作与归属：合作伙伴（PARTNER_OF / COOPERATES_WITH）、客户与服务对象（HAS_CUSTOMER / SERVES）、主管或归属机构（SUPERVISED_BY / BELONGS_TO）、获奖与资质（HAS_AWARD / HAS_QUALIFICATION）。
-7. 覆盖度优先：同一信息可以从多个角度各抽一条（既抽标签又抽业务领域是正常的）。关系类型拿不准时选最贴切的一个，实在没有就用 HAS_ATTRIBUTE。
+上面的粒度规则只约束「实体怎么命名、怎么拆分」，绝不意味着要少抽。公司官网里的定位语、口号、业务领域、技术方向、性质标签都是高价值信息，必须积极抽取成 实体+关系，宁多勿漏（关系名一律按命名语言规则用中文）：
+1. 公司性质与标签：「国有控股传播科技公司」「国家高新技术企业」「国内AIGC领军企业」这类定位描述必须抽取。所有权性质（国有控股/民营/合资/央企背景）单独作为实体，relation 用「公司性质」；行业/能力标签（如「传播科技」「高新技术企业」「领军企业」）用「标签」。按粒度规则，一个标签一个实体，不要把整句定位语拼成一个实体名。
+2. 口号/愿景/使命/价值观：网站标语、愿景宣言、价值观词汇（例如「赋万物为媒」「迎智能时代」「整合全球数据达到人人可用」「利他之心」）都要抽取，relation 分别用「口号」「愿景」「价值观」，实体类型可用「口号」或「理念」。
+3. 业务领域与泛概念：只要一个概念被用来描述公司的业务、行业、产品方向或技术底座——例如「大数据」「大模型」「AIGC」「数字人」「媒体融合」「智能传播」——即使它是泛概念也必须抽成实体（类型可用「领域」或「技术」），relation 用「所属领域」（行业/领域）、「采用技术」（技术底座）、「重点方向」（重点布局的方向）。泛概念不允许作为「投资方」「隶属于」这类事实型关系的客体，但作为上述属性型关系的客体完全正确。
+4. 趋势与新方向：「顺应XX趋势」「拥抱XX」「布局XX赛道」「深耕XX领域」——这类表述说明公司的战略动向，必须抽：relation 用「顺应趋势」「布局」。
+5. 地点与时间：公司所在地、注册地、覆盖区域（国家/省/市都算，relation 用「位于」「覆盖区域」）；成立时间、上线时间（relation 用「成立于」「上线于」）。
+6. 合作与归属：合作伙伴（「合作伙伴」「合作」）、客户与服务对象（「客户」「服务对象」）、主管或归属机构（「隶属于」）、获奖与资质（「获奖」「资质」）。
+7. 覆盖度优先：同一信息可以从多个角度各抽一条（既抽标签又抽业务领域是正常的）。关系名拿不准时选最贴切的一个，实在没有就用「属性」。
 """
 
 _PROMPT_ANCHOR = "- Ensure the knowledge graph is coherent and easily understandable"
 
 
 def _build_extract_prompt(with_props: bool) -> PromptTemplate:
-    """官方默认提示词 + 实体粒度规则 + 信息完备性规则（两种版本都要补，否则会丢属性抽取）。"""
+    """官方默认提示词 + 粒度规则 + 命名语言规则 + 信息完备性规则（两版都要补，否则丢属性抽取）。"""
     base = (
         DEFAULT_DYNAMIC_EXTRACT_PROPS_PROMPT if with_props else DEFAULT_DYNAMIC_EXTRACT_PROMPT
     )
     tmpl = base.template
-    rules = _ENTITY_GRANULARITY_RULES.strip() + "\n\n" + _COMPREHENSIVENESS_RULES.strip()
+    rules = (
+        _ENTITY_GRANULARITY_RULES.strip()
+        + "\n\n" + _NAMING_LANGUAGE_RULES.strip()
+        + "\n\n" + _COMPREHENSIVENESS_RULES.strip()
+    )
     if _PROMPT_ANCHOR in tmpl:
         tmpl = tmpl.replace(_PROMPT_ANCHOR, _PROMPT_ANCHOR + "\n\n" + rules, 1)
     else:
@@ -324,11 +338,26 @@ async def extract_from_chunk(text: str) -> dict:
     ent_by_id: dict[str, dict] = {}
     for ent in entities:
         eid = str(getattr(ent, "id", None) or getattr(ent, "id_", None) or "")
-        ent_by_id[eid] = {
+        info = {
             "name": str(getattr(ent, "name", "") or ""),
             "type": str(getattr(ent, "label", "") or ""),
             "props": dict(getattr(ent, "properties", {}) or {}),
         }
+        old = ent_by_id.get(eid)
+        if not old:
+            ent_by_id[eid] = info
+            continue
+        # 同名实体在多条三元组里重复出现时合并属性——
+        # 之前是"后出现的整体覆盖"，最后一条往往是空属性节点，
+        # 会把前面抽到的「成立时间/地址」等属性抹掉（实体信息变少的隐性原因之一）。
+        for k, v in info["props"].items():
+            if v is None or v == "" or v == {} or v == []:
+                continue
+            old["props"].setdefault(k, v)
+        if not old["type"] and info["type"]:
+            old["type"] = info["type"]
+        if not old["name"] and info["name"]:
+            old["name"] = info["name"]
 
     triplets: list[dict] = []
     for rel in relations:
