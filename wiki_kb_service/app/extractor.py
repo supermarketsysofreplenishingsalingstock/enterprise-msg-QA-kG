@@ -56,16 +56,31 @@ ENTITY GRANULARITY RULES（实体粒度规则，优先级最高）:
 - 别名处理：同一实体有简称/别称时，实体名统一使用最正式完整的名称，别称写进该实体的属性 alias。同一实体在所有三元组中名称必须完全一致（不要一处「阿里巴巴集团」、另一处「阿里」）。
 """
 
+# 信息完备性规则：粒度规则只约束"怎么命名/拆分"，绝不等于"少抽"。
+# 用户需求：公司网站上的口号、标签、泛概念（业务/技术方向）、国家地区等
+# 都是高价值信息，必须积极抽成 实体+关系，宁可多不可漏。
+_COMPREHENSIVENESS_RULES = """
+COMPREHENSIVENESS RULES（信息完备性规则，与粒度规则同等重要）:
+上面的粒度规则只约束「实体怎么命名、怎么拆分」，绝不意味着要少抽。公司官网里的定位语、口号、业务领域、技术方向、性质标签都是高价值信息，必须积极抽取成 实体+关系，宁多勿漏：
+1. 公司性质与标签：「国有控股传播科技公司」「国家高新技术企业」「国内AIGC领军企业」这类定位描述必须抽取。所有权性质（国有控股/民营/合资/央企背景）单独作为实体（类型可用「标签」），relation 用 COMPANY_NATURE；行业/能力标签（如「传播科技」「高新技术企业」「领军企业」）用 HAS_TAG。按粒度规则，一个标签一个实体，不要把整句定位语拼成一个实体名。
+2. 口号/愿景/使命/价值观：网站标语、愿景宣言、价值观词汇（例如「赋万物为媒」「迎智能时代」「整合全球数据达到人人可用」「利他之心」）都要抽取，relation 用 HAS_SLOGAN（口号）、HAS_VISION（愿景）、HAS_VALUE（价值观），实体类型可用「口号」或「理念」。
+3. 业务领域与泛概念：只要一个概念被用来描述公司的业务、行业、产品方向或技术底座——例如「大数据」「大模型」「AIGC」「数字人」「媒体融合」「智能传播」——即使它是泛概念也必须抽成实体（类型可用「领域」或「技术」），relation 用 OPERATES_IN（所属行业/领域）、USES_TECH（采用的技术）、FOCUS_ON（重点布局的方向）。泛概念不允许作为 INVESTED_BY、OWNED_BY 这类事实型关系的客体，但作为上述属性型关系的客体完全正确。
+4. 趋势与新方向：「顺应XX趋势」「拥抱XX」「布局XX赛道」「深耕XX领域」——这类表述说明公司的战略动向，必须抽：FOLLOWS_TREND（顺应的趋势）、EXPANDS_INTO（新进入的领域）。
+5. 地点与时间：公司所在地、注册地、覆盖区域（国家/省/市都算，relation 用 LOCATED_IN / COVERS_REGION）；成立时间、上线时间（FOUNDED_IN / LAUNCHED_IN）。
+6. 合作与归属：合作伙伴（PARTNER_OF / COOPERATES_WITH）、客户与服务对象（HAS_CUSTOMER / SERVES）、主管或归属机构（SUPERVISED_BY / BELONGS_TO）、获奖与资质（HAS_AWARD / HAS_QUALIFICATION）。
+7. 覆盖度优先：同一信息可以从多个角度各抽一条（既抽标签又抽业务领域是正常的）。关系类型拿不准时选最贴切的一个，实在没有就用 HAS_ATTRIBUTE。
+"""
+
 _PROMPT_ANCHOR = "- Ensure the knowledge graph is coherent and easily understandable"
 
 
 def _build_extract_prompt(with_props: bool) -> PromptTemplate:
-    """官方默认提示词 + 实体粒度规则（两种版本都要补，否则会丢属性抽取）。"""
+    """官方默认提示词 + 实体粒度规则 + 信息完备性规则（两种版本都要补，否则会丢属性抽取）。"""
     base = (
         DEFAULT_DYNAMIC_EXTRACT_PROPS_PROMPT if with_props else DEFAULT_DYNAMIC_EXTRACT_PROMPT
     )
     tmpl = base.template
-    rules = _ENTITY_GRANULARITY_RULES.strip()
+    rules = _ENTITY_GRANULARITY_RULES.strip() + "\n\n" + _COMPREHENSIVENESS_RULES.strip()
     if _PROMPT_ANCHOR in tmpl:
         tmpl = tmpl.replace(_PROMPT_ANCHOR, _PROMPT_ANCHOR + "\n\n" + rules, 1)
     else:
