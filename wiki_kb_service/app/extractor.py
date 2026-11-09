@@ -66,6 +66,18 @@ NAMING LANGUAGE RULES（命名语言规则，强制）:
 - 上面列出的关系名只是常用参考，允许自由归纳更贴切的中文关系名，但必须是中文。
 """
 
+# 实体类型判定规则：修复两类高频错型——政府部门被当成奖项、公司被笼统标成机构。
+_ENTITY_TYPE_RULES = """
+ENTITY TYPE RULES（实体类型判定规则，强制）:
+- 实体类型必须按「这个实体本身是什么」判定，而不是按它出现在什么关系里、或原文怎么提到它：
+  ① 公司/集团/企业——名称含「集团」「有限公司」「股份有限公司」「科技公司」等（例如「阿里巴巴集团」）→ 类型必须是「公司」，绝不能笼统写成「机构」；
+  ② 政府部门与国家机关——名称通常以「部」「委」「局」「署」「厅」「办公室」「委员会」结尾（如「国家发展改革委」「工业和信息化部」「文化和旅游部」「科技部」）→ 类型必须是「政府机构」；
+  ③ 通讯社、报社、电视台等媒体单位 →「媒体机构」；行业协会、联盟 →「组织」；其他事业单位 →「机构」；人物 →「人物」。
+- 「获奖」关系的客体只能是真正的奖项或荣誉称号（名称里通常含「奖」「大奖」「冠军」等）。政府部门绝不是奖项：原文「获XX部/XX委批准、备案、批复」应抽成 relation「资质」、客体类型「资质」，绝不能把政府部门抽成获奖对象。
+- 「试点单位」「重点实验室建设方」「标准制定者」「领军企业」「示范项目」这类称号与认定用 relation「资质」、客体类型「资质」；「国家高新技术企业」这类认定同样用「资质」。
+- 拿不准类型时先问一句：它是一个「会做事的主体」还是一个「东西/一句话/一个时间」？主体 → 公司/机构/政府机构/组织/人物；不是主体 → 产品/技术/领域/奖项/资质/口号/愿景/价值观/标签/日期/地点/概念。
+"""
+
 # 信息完备性规则：粒度规则只约束"怎么命名/拆分"，绝不等于"少抽"。
 # 用户需求：公司网站上的口号、标签、泛概念（业务/技术方向）、国家地区等
 # 都是高价值信息，必须积极抽成 实体+关系，宁可多不可漏。
@@ -93,6 +105,7 @@ def _build_extract_prompt(with_props: bool) -> PromptTemplate:
     rules = (
         _ENTITY_GRANULARITY_RULES.strip()
         + "\n\n" + _NAMING_LANGUAGE_RULES.strip()
+        + "\n\n" + _ENTITY_TYPE_RULES.strip()
         + "\n\n" + _COMPREHENSIVENESS_RULES.strip()
     )
     if _PROMPT_ANCHOR in tmpl:
@@ -379,10 +392,66 @@ async def extract_from_chunk(text: str) -> dict:
                 "tail_props": _clean_props(dst.get("props")),
             }
         )
-    return {"error": None, "triplets": triplets}
+    return {"error": None, "triplets": _normalize_triplets(triplets)}
 
 
 _HIDE_PROPS = {"triplet_source_id", "embedding", "id", "source_id", "target_id"}
+
+
+# ── 抽取结果安全网：本地小模型偶尔不理会提示词，这里对高频错型做确定性纠正 ──
+# ① 模型仍输出英文大写关系名/类型名 → 映射成中文（用户要求全中文展示）
+# ② 政府部门被标成 奖项/资质/机构 → 改为「政府机构」；若还在「获奖」关系里 → 改为「批准机构」
+# ③ 集团/有限公司被标成 机构/组织 → 改为「公司」（与「文旅机构」这类真机构区分开）
+_EN_RELATION_MAP = {
+    "INVESTED_BY": "投资方", "INVESTS_IN": "投资了", "HAS_PRODUCT": "产品",
+    "DEVELOPS": "开发了", "LAUNCHES": "推出了", "HAS_SERVICE": "提供",
+    "SERVES": "服务对象", "HAS_CUSTOMER": "客户", "OPERATES_IN": "所属领域",
+    "USES_TECH": "采用技术", "FOCUS_ON": "重点方向", "COMPANY_NATURE": "公司性质",
+    "HAS_TAG": "标签", "HAS_SLOGAN": "口号", "HAS_VISION": "愿景",
+    "HAS_VALUE": "价值观", "HAS_AWARD": "获奖", "HAS_QUALIFICATION": "资质",
+    "LOCATED_IN": "位于", "COVERS_REGION": "覆盖区域", "FOUNDED_IN": "成立于",
+    "LAUNCHED_IN": "上线于", "FOLLOWS_TREND": "顺应趋势", "EXPANDS_INTO": "布局",
+    "PARTNER_OF": "合作伙伴", "COOPERATES_WITH": "合作", "SUPERVISED_BY": "隶属于",
+    "BELONGS_TO": "隶属于", "OWNED_BY": "隶属于", "SUBSIDIARY_OF": "子公司",
+    "HAS_ATTRIBUTE": "属性",
+}
+_EN_TYPE_MAP = {
+    "COMPANY": "公司", "INSTITUTION": "机构", "ORGANIZATION": "组织",
+    "PRODUCT": "产品", "TECHNOLOGY": "技术", "TECH": "技术", "FIELD": "领域",
+    "DOMAIN": "领域", "AWARD": "奖项", "QUALIFICATION": "资质", "LICENSE": "资质",
+    "TAG": "标签", "SLOGAN": "口号", "VISION": "愿景", "VALUE": "价值观",
+    "TIME": "日期", "DATE": "日期", "LOCATION": "地点", "PLACE": "地点",
+    "PERSON": "人物", "CONCEPT": "概念", "PLATFORM": "平台", "MEDIA": "媒体机构",
+}
+_GOV_BODY_RE = re.compile(
+    r".*(部|委员会|办公室|管理局|发改委|发展改革委|国务院|工信部|文旅部|科技部)$"
+)
+
+
+def _normalize_triplets(triplets: list[dict]) -> list[dict]:
+    for t in triplets:
+        rel = str(t.get("relation") or "").strip()
+        if rel and rel.isascii():
+            t["relation"] = _EN_RELATION_MAP.get(rel.upper(), rel)
+        for side in ("head", "tail"):
+            name = str(t.get(side) or "").strip()
+            typ = str(t.get(f"{side}_type") or "").strip()
+            if typ and typ.isascii() and typ.upper() in _EN_TYPE_MAP:
+                typ = _EN_TYPE_MAP[typ.upper()]
+                t[f"{side}_type"] = typ
+            if not name:
+                continue
+            if _GOV_BODY_RE.match(name):
+                if typ in {"奖项", "资质", "机构", "INSTITUTION", "AWARD", "LICENSE"}:
+                    t[f"{side}_type"] = "政府机构"
+                if side == "tail" and t.get("relation") in {"获奖", "HAS_AWARD"}:
+                    t["relation"] = "批准机构"  # 「获XX部批准」被误抽成获奖时纠正
+            elif (
+                typ in {"机构", "组织", "INSTITUTION", "ORGANIZATION"}
+                and ("集团" in name or "有限公司" in name or "股份有限公司" in name)
+            ):
+                t[f"{side}_type"] = "公司"
+    return triplets
 
 
 def _clean_props(props: dict | None) -> dict:
