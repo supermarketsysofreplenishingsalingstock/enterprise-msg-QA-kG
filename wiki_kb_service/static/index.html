@@ -162,6 +162,7 @@
 <script>
 const API = "";
 let chart = null;
+let chartResizeObserver = null;
 let graphNodes = [];
 let currentCompany = "";
 
@@ -524,6 +525,9 @@ function renderGraph(data){
       labelLayout:{hideOverlap:true},
     }],
   },true);
+  // setOption 时容器可能还不是最终高度（加载标签隐藏、侧栏布局变化等），
+  // 图例按旧高度排位会被裁到画布外（表现为"图例消失"），下一帧强制 resize 重排
+  requestAnimationFrame(()=>chart.resize());
   const c=data.counts||{};
   document.getElementById("countsLabel").textContent=
     `实体 ${graphNodes.length}/${c.entities||0} · 关系 ${(data.edges||[]).length}/${c.triplets||0} · 文本块 ${c.chunks||0} · 快照 ${c.snapshots||0}`;
@@ -538,6 +542,14 @@ function edgePropsTip(edge){
 
 chart=echarts.init(document.getElementById("graphChart"),null,{renderer:"canvas"});
 chart.on("click",params=>{if(params.dataType==="node")showDetail(params.data.id)});
+// 容器尺寸任何变化（窗口缩放/视图切换/加载标签显隐）都触发重排，保证图例永远在画布内
+if(window.ResizeObserver&&!chartResizeObserver){
+  chartResizeObserver=new ResizeObserver(()=>{
+    const w=document.getElementById("graphWrap");
+    if(chart&&w&&w.offsetParent!==null)chart.resize();
+  });
+  chartResizeObserver.observe(document.getElementById("graphChart"));
+}
 
 async function showDetail(ekey){
   if(!currentCompany)return;
