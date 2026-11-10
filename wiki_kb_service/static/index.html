@@ -452,6 +452,22 @@ const TYPE_COLORS={
   "价值观":"#ffb300","理念":"#f0a132","日期":"#9575cd","时间":"#9575cd",
   "地点":"#4db6ac","金额":"#dce775","其他":"#90a4ae"
 };
+// 未登记类型的备用色板：按类型名哈希取色（同一类型永远同一颜色），
+// 并避开已被固定配色占用的颜色，避免与既有类型撞色、也避免"按出现顺序取色"导致整体错位。
+const EXTRA_COLORS=["#7e9ff5","#5fc9a4","#d9a95f","#c98b8b","#b79cf0","#6fc9d2","#e8a3c8","#a8cf7a","#f0b07a","#a9b7c6","#e0cf7a","#9aa2d6"];
+const USED_COLORS=new Set(Object.values(TYPE_COLORS));
+function hashType(t){let h=0;for(const ch of String(t))h=(h*31+ch.codePointAt(0))>>>0;return h}
+function buildTypeColors(types){
+  const m={};
+  types.filter(t=>TYPE_COLORS[t]).forEach(t=>m[t]=TYPE_COLORS[t]);
+  // 按名称排序后再分色，保证同一批类型得到同一套颜色（顺序无关）
+  types.filter(t=>!TYPE_COLORS[t]).sort().forEach(t=>{
+    const used=new Set(Object.values(m));
+    const avail=EXTRA_COLORS.filter(c=>!used.has(c));
+    m[t]=avail.length?avail[hashType(t)%avail.length]:colorPool[hashType(t)%colorPool.length];
+  });
+  return m;
+}
 
 async function loadGraph(){
   if(!currentCompany)return;
@@ -472,7 +488,7 @@ async function loadGraph(){
 function renderGraph(data){
   graphNodes=data.nodes||[];
   const types=[...new Set(graphNodes.map(n=>n.type||"其他"))];
-  const typeColor={};types.forEach((t,i)=>typeColor[t]=TYPE_COLORS[t]||colorPool[i%colorPool.length]);
+  const typeColor=buildTypeColors(types);
   const eNodes=graphNodes.map(n=>({
     id:n.id,name:n.name,
     symbolSize:Math.min(46,10+Math.sqrt(n.degree||1)*6),

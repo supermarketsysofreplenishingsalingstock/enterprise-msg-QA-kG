@@ -58,8 +58,8 @@ LLM_REQUEST_TIMEOUT = _env_int("KB_LLM_REQUEST_TIMEOUT", 600)
 LLM_CONTEXT_WINDOW = _env_int("KB_LLM_CONTEXT_WINDOW", 16384)
 
 # ── 抽取参数（全部开放式，不预设 schema）──
-# 默认 60：口号/标签/业务领域等属性型信息也要入图，25 太紧会截断
-MAX_TRIPLETS_PER_CHUNK = _env_int("KB_MAX_TRIPLETS_PER_CHUNK", 60)
+# 默认 90：开放体系下要抽的类别变多（组织/客户/产品细节/技术/里程碑等），60 容易截断
+MAX_TRIPLETS_PER_CHUNK = _env_int("KB_MAX_TRIPLETS_PER_CHUNK", 90)
 CHUNK_SIZE = _env_int("KB_CHUNK_SIZE", 1200)
 CHUNK_OVERLAP = _env_int("KB_CHUNK_OVERLAP", 150)
 # 属性生成模式：any=LLM 自由生成任意属性；none=关闭属性生成；或逗号分隔的属性名列表
