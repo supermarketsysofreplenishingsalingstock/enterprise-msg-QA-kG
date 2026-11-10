@@ -33,7 +33,8 @@
   main{flex:1;display:flex;min-height:0}
   #graphWrap{flex:1;position:relative;min-width:0}
   #graphChart{width:100%;height:100%}
-  .counts{position:absolute;left:14px;bottom:12px;color:var(--muted);font-size:12px;background:rgba(13,20,32,.75);padding:4px 10px;border-radius:6px;border:1px solid var(--line)}
+  /* 统计标签放右上角：图例固定在画布底部居中，放左下会与图例/翻页箭头重叠 */
+  .counts{position:absolute;right:14px;top:12px;color:var(--muted);font-size:12px;background:rgba(13,20,32,.75);padding:4px 10px;border-radius:6px;border:1px solid var(--line)}
   aside{width:340px;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
   aside .panel-head{padding:10px 14px;border-bottom:1px solid var(--line);font-size:13px;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
   aside .panel-body{flex:1;overflow-y:auto;padding:12px 14px}
@@ -514,7 +515,8 @@ function renderGraph(data){
         :`<b>${esc(p.name)}</b><br/>类型: ${esc(nodeType(p.data.id))}`,
       extraCssText:"max-width:420px;white-space:normal;"
     },
-    legend:{data:types,type:"scroll",bottom:10,textStyle:{color:"#8296ab"}},
+    // 图例固定底部居中；统计标签已移到右上角，互不重叠
+    legend:{data:types,type:"scroll",bottom:12,left:"center",textStyle:{color:"#8296ab"}},
     series:[{
       type:"graph",layout:"force",roam:true,draggable:true,
       categories:types.map(t=>({name:t})),
