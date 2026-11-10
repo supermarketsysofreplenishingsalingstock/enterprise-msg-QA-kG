@@ -441,6 +441,17 @@ function fillDiffSelectors(snaps){  const opts=snaps.map(s=>`<option value="${es
 
 // ───────── 图谱 ─────────
 const colorPool=["#4f8ef7","#34c77b","#f0a132","#ef5b5b","#a06ef5","#22c3d6","#e56db1","#8bc34a","#ff8a65","#90a4ae","#ffd54f","#7986cb"];
+// 固定语义配色：类型→颜色一一对应，不随数据里出现顺序漂移
+//（此前是"按类型首次出现顺序依次取色"，重建后顺序一变，理念/公司性质的颜色就会互换）
+const TYPE_COLORS={
+  "公司":"#4f8ef7","机构":"#34c77b","政府机构":"#ef5b5b","媒体机构":"#22c3d6",
+  "组织":"#7986cb","人物":"#a06ef5","产品":"#ff8a65","解决方案":"#a1887f",
+  "平台":"#8bc34a","技术":"#26c6da","领域":"#9ccc65","概念":"#90a4ae",
+  "标签":"#ffd54f","资质":"#b0bec5","奖项":"#e57373",
+  "公司性质":"#e56db1","性质":"#e56db1","口号":"#f06292","愿景":"#ba68c8",
+  "价值观":"#ffb300","理念":"#f0a132","日期":"#9575cd","时间":"#9575cd",
+  "地点":"#4db6ac","金额":"#dce775","其他":"#90a4ae"
+};
 
 async function loadGraph(){
   if(!currentCompany)return;
@@ -461,7 +472,7 @@ async function loadGraph(){
 function renderGraph(data){
   graphNodes=data.nodes||[];
   const types=[...new Set(graphNodes.map(n=>n.type||"其他"))];
-  const typeColor={};types.forEach((t,i)=>typeColor[t]=colorPool[i%colorPool.length]);
+  const typeColor={};types.forEach((t,i)=>typeColor[t]=TYPE_COLORS[t]||colorPool[i%colorPool.length]);
   const eNodes=graphNodes.map(n=>({
     id:n.id,name:n.name,
     symbolSize:Math.min(46,10+Math.sqrt(n.degree||1)*6),
