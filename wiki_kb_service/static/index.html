@@ -489,6 +489,8 @@ function renderGraph(data){
   window.addEventListener("resize",()=>chart.resize());
   chart.setOption({
     backgroundColor:"transparent",
+    // 类别色板按 categories 顺序对齐 TYPE_COLORS，保证图例颜色与节点实际颜色一致
+    color:types.map(t=>typeColor[t]),
     tooltip:{
       formatter:p=>p.dataType==="edge"
         ?`<b>${esc(p.data.source&&edgeName(p.data.source))} —[${esc(p.data.label.formatter)}]→ ${esc(edgeName(p.data.target))}</b>${edgePropsTip(p.data)}`
