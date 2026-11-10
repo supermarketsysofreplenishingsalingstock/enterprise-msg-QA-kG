@@ -146,6 +146,25 @@
             />
           </div>
           <div class="company-options">
+            <label class="company-check" title="爬取范围：1=只爬主页；2=分层精选（只抓最相关的 N 页）；3=爬全站；4=爬全站及全站外链站点（范围大，慎重选择）">
+              爬取范围
+              <select v-model.number="crawlScopeMode" class="scope-select" :disabled="status === 'running'">
+                <option :value="1">1 · 只爬主页</option>
+                <option :value="2">2 · 分层精选爬最相关页面</option>
+                <option :value="3">3 · 爬全站</option>
+                <option :value="4">4 · 全站 + 外部链接站点（慎选）</option>
+              </select>
+              <input
+                v-if="crawlScopeMode >= 2"
+                v-model.number="crawlMaxPages"
+                type="number"
+                min="1"
+                max="200"
+                class="input-field scope-pages"
+                :disabled="status === 'running'"
+              />
+              <span v-if="crawlScopeMode >= 2" class="scope-hint">页</span>
+            </label>
             <label class="company-check">
               <input v-model="collectAttachments" type="checkbox" />
               下载站内挂载文件（PDF / DOCX / XLSX 等）
@@ -745,6 +764,14 @@ const companyTraits = ref('')
 const collectAttachments = ref(true)
 // 爬取后是否自动抽取（不勾选时内容仍会存入知识库为「待处理」，可在图谱页手动处理）
 const kbAutoExtract = ref(true)
+// 爬取范围：1=只爬主页 2=分层精选爬 N 页 3=爬全站 4=爬全站+外部链接站点（慎选）
+const crawlScopeMode = ref<1 | 2 | 3 | 4>(2)
+const crawlMaxPages = ref(45)
+watch(crawlScopeMode, (m) => {
+  // 切到全站/全站+外链时，预算默认放大到 200；切回精选恢复 45
+  if ((m === 3 || m === 4) && Number(crawlMaxPages.value) <= 45) crawlMaxPages.value = 200
+  if (m === 2 && Number(crawlMaxPages.value) >= 200) crawlMaxPages.value = 45
+})
 const companySearching = ref(false)
 const companyCandidates = ref<any[]>([])
 const companySearchMessage = ref('')
@@ -820,7 +847,13 @@ function startCompanyCrawl(crawlAll: boolean) {
   }
   if (!companyName.value.trim() && clarifyName) companyName.value = clarifyName
   const traits = String(companyTraits.value ?? '').trim()
-  task.value = `帮我爬取${name}官网的整站信息${traits ? `（条件特征：${traits}）` : ''}，包括页面内容和站内挂载文件`
+  const scopeMode = Number(crawlScopeMode.value) || 2
+  const scopePages = Math.max(1, Math.min(200, Math.floor(Number(crawlMaxPages.value) || 45)))
+  // 任务文案与范围匹配：范围 1 不含“整站”字样，避免被识别为站点爬取
+  task.value =
+    scopeMode === 1
+      ? `帮我爬取${name}官网主页的信息${traits ? `（条件特征：${traits}）` : ''}，包括页面内容和站内挂载文件`
+      : `帮我爬取${name}官网的整站信息${traits ? `（条件特征：${traits}）` : ''}，包括页面内容和站内挂载文件`
   ;(options as any).__managerSeedUrls = urls
   ;(options as any).__seedFirstMode = true
   ;(options as any).companyCrawl = true
@@ -828,10 +861,23 @@ function startCompanyCrawl(crawlAll: boolean) {
   ;(options as any).companyTraits = traits
   ;(options as any).collectAttachments = collectAttachments.value
   ;(options as any).__kbAutoIngest = kbAutoExtract.value
-  ;(options as any).siteCrawl = true
-  ;(options as any).maxPages = Math.max(Number(options.maxPages ?? 0), 8)
-  ;(options as any).maxDepth = Math.max(Number(options.maxDepth ?? 0), 2)
-  pushLog('info', `公司爬取：已选 ${urls.length} 个站点，开始任务`)
+  ;(options as any).crawlScopeMode = scopeMode
+  if (scopeMode === 1) {
+    // 只爬主页：每个选中站点抓首页一条
+    ;(options as any).siteCrawl = false
+    ;(options as any).pageMode = 'single'
+    ;(options as any).siteCrawlScope = 'host'
+    ;(options as any).maxPages = Math.max(1, urls.length)
+    ;(options as any).maxItems = Math.max(Number(options.maxItems ?? 0), urls.length)
+  } else {
+    ;(options as any).siteCrawl = true
+    ;(options as any).pageMode = 'single'
+    ;(options as any).siteCrawlScope = scopeMode === 4 ? 'linked' : 'host'
+    ;(options as any).maxPages = scopePages
+    ;(options as any).maxDepth = Math.max(Number(options.maxDepth ?? 0), scopeMode === 2 ? 2 : 3)
+  }
+  const scopeName = { 1: '只爬主页', 2: `分层精选（${scopePages} 页）`, 3: `全站（预算 ${scopePages} 页）`, 4: `全站+外部链接（预算 ${scopePages} 页，慎用）` }[scopeMode] || ''
+  pushLog('info', `公司爬取：范围=${scopeName}；已选 ${urls.length} 个站点，开始任务`)
   start()
 }
 
@@ -1855,6 +1901,26 @@ body {
   font-size: 12px;
   color: var(--text-dim);
   cursor: pointer;
+}
+
+.scope-select {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-dim);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 4px;
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
+.scope-pages {
+  width: 72px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+.scope-hint {
+  font-size: 12px;
+  color: var(--text-dim);
 }
 
 .candidate-list {

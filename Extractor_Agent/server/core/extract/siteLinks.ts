@@ -103,12 +103,28 @@ export function extractSiteLinks(html: string, baseUrl: string, opts: SiteLinkOp
   return out
 }
 
-/** 浅层、短路径优先，让 BFS 覆盖面更均衡 */
+/**
+ * 链接入队排序：相关度优先（公司信息类页面排前面），浅层、短路径优先做次级排序，
+ * 让「分层精选爬 N 页」在预算内优先抓到公司简介/产品/资质/动态等高价值页面。
+ */
+const RELEVANT_PATH =
+  /(?:about|intro|profile|company|corp|product|service|solution|business|news|info|dynamic|develop|qualif|honor|honour|certif|case|culture|value|team|partner|contact|join|recruit|career|brief|vision|mission|history|背景|简介|概况|关于|产品|服务|方案|业务|新闻|动态|资讯|资质|荣誉|奖项|认证|案例|文化|价值观|理念|愿景|使命|团队|伙伴|合作|联系|招聘|加入|发展|历程)/i
+
+/** 低价值路径（仅降权不丢弃：标签/分页/搜索等列表噪声） */
+const LOW_VALUE_PATH = /(?:tag|tags|label|category|page\/\d+|\?page=|\/node\/\d+|feed|rss|sitemap|login|register|search)/i
+
 export function rankSiteLinks(links: string[]): string[] {
   const score = (u: string) => {
     try {
-      const parts = new URL(u).pathname.split('/').filter(Boolean)
-      return parts.length * 1000 + parts.join('/').length
+      const url = new URL(u)
+      const parts = url.pathname.split('/').filter(Boolean)
+      // 相关度：命中关键词强加分（放最前），低价值路径降分
+      const path = `${url.pathname}${url.search}`
+      let s = 0
+      if (RELEVANT_PATH.test(path)) s -= 10_000
+      if (LOW_VALUE_PATH.test(path)) s += 8_000
+      // 次级：浅层、短路径优先，覆盖面更均衡
+      return s + parts.length * 1000 + parts.join('/').length
     } catch {
       return 1_000_000
     }

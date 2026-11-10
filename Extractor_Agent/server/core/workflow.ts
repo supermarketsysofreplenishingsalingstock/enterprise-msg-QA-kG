@@ -120,6 +120,11 @@ function nowTs() {
   return Date.now()
 }
 
+/** 计划是否为「站点爬取」（跟随内链的 BFS 抓取） */
+function siteCrawlPlanned(plan: Plan): boolean {
+  return Boolean(plan.siteCrawl)
+}
+
 function sleep(ms: number, signal?: AbortSignal) {
   const t = Math.max(0, Math.floor(ms))
   if (!t) return Promise.resolve()
@@ -359,6 +364,13 @@ export async function runCrawlerWorkflow(params: {
 
     const maxPages = Number(plan.maxPages ?? 1)
     const maxItems = Number(plan.maxItems ?? 10)
+    ;(state.options as any).__crawlMaxPages = maxPages
+    if (siteCrawlPlanned(plan)) {
+      params.emitLog(
+        'info',
+        `Master：抓取范围=站点爬取（scope=${plan.siteCrawlScope ?? 'auto'}，预算 ${maxPages} 页，深度 ${plan.maxDepth ?? 2}）`,
+      )
+    }
     const baseConcurrency = Number((state.options as any)?.maxConcurrency ?? 3)
     const maxConcurrency = plan.target === 'douban_top250' ? 1 : baseConcurrency
 
@@ -592,7 +604,13 @@ export async function runCrawlerWorkflow(params: {
           const pageText = extractPageText(snapshot.html, 8000)
           if (pageText) {
             const kbPages: any[] = ((state.options as any).__kbPages ??= [])
-            kbPages.push({ url: pageUrlKb, title: String(snapshot.title || pageUrlKb), text: pageText })
+            // 内容去重：同一正文被不同 URL（跳转/规范化变体）抓到时只保留一条
+            const kbTextSeen: Set<string> = ((state.options as any).__kbTextSeen ??= new Set())
+            const textKey = normalizeWhitespace(pageText).slice(0, 1200)
+            if (!kbTextSeen.has(textKey)) {
+              kbTextSeen.add(textKey)
+              kbPages.push({ url: pageUrlKb, title: String(snapshot.title || pageUrlKb), text: pageText })
+            }
           }
         } catch {}
         const collectAttachments = (state.options as any)?.collectAttachments === true
@@ -707,6 +725,14 @@ export async function runCrawlerWorkflow(params: {
           s.lastError = errMsg
           if (/\b429\b/i.test(s.lastError) || /too many/i.test(s.lastError)) limiter.backoff(host, 2)
           if (/\b403\b/i.test(s.lastError) || /forbidden/i.test(s.lastError)) limiter.backoff(host, 1)
+          // 超时/连接被拒也纳入指数退避：连续失败会逐步扩大间隔（DomainRateLimiter 累积）
+          if (
+            /\btimeout\b|\btimed?\s?out\b|etimedout|econnreset|econnrefused|socket hang up|network/i.test(
+              s.lastError,
+            )
+          ) {
+            limiter.backoff(host, 1)
+          }
         }
         params.emitLog('warn', `Worker：单 URL 抓取失败，已跳过继续其它种子：${url}；原因=${errMsg.slice(0, 120)}`)
         return []
@@ -947,7 +973,10 @@ export async function runCrawlerWorkflow(params: {
       ? (mergedOptions as any).__attachments
       : [],
     kbPages: Array.isArray((mergedOptions as any).__kbPages)
-      ? (mergedOptions as any).__kbPages.slice(0, 60)
+      ? (mergedOptions as any).__kbPages.slice(
+          0,
+          Math.max(60, Math.min(500, Number((mergedOptions as any).__crawlMaxPages ?? 0) + 20)),
+        )
       : [],
     output: { format: params.taskPlan.outputSpec.format, content: formattedOutput },
     quality: evalResult.quality,
