@@ -1,6 +1,7 @@
 """wiki_kb_service — 公司信息知识库 + LLM Wiki + DynamicLLMPathExtractor 图谱服务"""
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from . import config, graph_service, graph_store, jobs, wiki
+from . import config, graph_service, graph_store, jobs, retrieval, wiki
 from .ingest import run_ingest, run_process_pending, run_reextract
 from .llm_factory import llm_health
 
@@ -37,6 +38,12 @@ class ProcessPendingPayload(BaseModel):
 class ReextractPayload(BaseModel):
     company: str = Field(..., description="公司名称或 slug")
     chunk_ids: list[int] = Field(..., description="要重新抽取的 chunk id 列表")
+
+
+class AskPayload(BaseModel):
+    company: str = Field(..., description="公司名称或 slug")
+    question: str = Field(..., description="用户问题")
+    use_llm: bool = Field(True, description="False 时只检索、不调用模型（调试用）")
 
 
 @app.get("/api/chunks")
@@ -327,6 +334,65 @@ async def wiki_page(company: str = Query(...), name: str = Query(...)):
 @app.get("/api/wiki/index")
 async def wiki_index(company: str = Query(...)):
     return {"index": wiki.read_index(_slug(company)), "log": wiki.read_log(_slug(company))}
+
+
+@app.post("/api/ask")
+async def ask(payload: AskPayload):
+    """零向量问答：LLM 查询理解 → 图谱/BM25 多路召回 → 带出处回答。
+
+    全程不依赖向量库：图谱三元组精确作答 + BM25 全文兜底（参考 llm-wiki 通用检索做法）。
+    """
+    question = str(payload.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="问题不能为空")
+    try:
+        result = await asyncio.to_thread(
+            retrieval.ask, _slug(payload.company), question, payload.use_llm
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="公司不存在")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"问答失败：{type(e).__name__}: {e}")
+    return JSONResponse(result)
+
+
+@app.get("/api/search")
+async def search(
+    company: str = Query(...),
+    q: str = Query(..., description="检索词"),
+    use_llm: bool = Query(False, description="是否用 LLM 做查询理解"),
+):
+    """只做检索、不生成回答：返回三路召回与 RRF 融合结果（调检索用）。"""
+    question = str(q or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="检索词不能为空")
+    slug = _slug(company)
+    try:
+        idx = await asyncio.to_thread(retrieval.get_index, slug)
+        understood = await asyncio.to_thread(
+            retrieval.understand_query, question, idx.company_name, use_llm
+        )
+        got = await asyncio.to_thread(retrieval.retrieve, slug, question, understood)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="公司不存在")
+    return {
+        "understanding": understood,
+        "routes": got["routes"],
+        "query_terms": got["query_terms"][:40],
+        "hits": [
+            {
+                "kind": h.kind,
+                "key": h.key,
+                "title": h.doc.title,
+                "snippet": h.doc.text[:220],
+                "routes": list(h.ranks.keys()),
+                "rrf": round(h.score, 5),
+            }
+            for h in got["hits"][:20]
+        ],
+    }
 
 
 def _slug(company: str) -> str:

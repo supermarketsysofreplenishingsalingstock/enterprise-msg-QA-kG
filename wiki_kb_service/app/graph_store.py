@@ -492,6 +492,18 @@ def count_chunks(company_id: int, snapshot_id: str) -> int:
         )
 
 
+def chunks_with_text(company_id: int, limit: int = 2000) -> list[dict]:
+    """取 chunk 全文（BM25 全文检索用；list_chunks 只返回 snippet）。"""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id AS chunk_id, snapshot_id, source_url, source_title, source_kind,"
+            " ord, text FROM chunks WHERE company_id=?"
+            " ORDER BY snapshot_id DESC, ord LIMIT ?",
+            (company_id, int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def entities_for_company(company_id: int) -> list[sqlite3.Row]:
     with connect() as conn:
         return conn.execute(
