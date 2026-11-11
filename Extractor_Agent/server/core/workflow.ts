@@ -23,6 +23,7 @@ import {
 import { buildSeedFirstPlan, applyCrawlIntent, detectCrawlIntent } from '../services/crawlerAgentFrontload'
 import { uniqByUrl, extractDoubanTop250ListPage, extractJdPhbListPage, extractGenericListPage } from './extract/generic'
 import { extractSiteLinks, rankSiteLinks, extractAttachmentLinks } from './extract/siteLinks'
+import { discoverSiteRoutes } from './extract/siteRoutes'
 import { downloadAttachment, extractPageText } from './fetch/fileDownload'
 import { type StructuredTaskPlan } from '../services/crawlerAgentTaskPlanning'
 import { formatItemsByOutputSpec } from './verify/qualityGate'
@@ -123,6 +124,51 @@ function nowTs() {
 /** 计划是否为「站点爬取」（跟随内链的 BFS 抓取） */
 function siteCrawlPlanned(plan: Plan): boolean {
   return Boolean(plan.siteCrawl)
+}
+
+/**
+ * 尾斜杠变体：不少站点（Nuxt static/nginx）只认 `/about/` 而不认 `/about`，
+ * 或把无斜杠的 URL 301 到内网端口（如 :8081）导致公网连不上。
+ * 抓取失败时用变体重试一次，能救回整站里有内容的子页。
+ */
+export function toggleTrailingSlash(u: string): string {
+  try {
+    const url = new URL(u)
+    const p = url.pathname || '/'
+    const next = p.endsWith('/') ? p.replace(/\/+$/, '') : `${p}/`
+    if (!next || next === '/' || next === p) return ''
+    url.pathname = next
+    return url.toString()
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 轻量探活（HEAD，默认 3.5s）：只判断这个 URL 形态在当前网络下是否真能拿到响应。
+ * 301 跳到别的 host:port（公司内网 8081 之类）算不可达——否则正式抓取会白等连接超时。
+ */
+export async function probeReachableAbs(u: string, userAgent: string, timeoutMs = 3500): Promise<boolean> {
+  try {
+    const res = await fetch(u, {
+      method: 'HEAD',
+      redirect: 'manual',
+      signal: AbortSignal.timeout(Math.max(800, Math.floor(Number(timeoutMs) || 3500))),
+      headers: { 'user-agent': userAgent || 'Mozilla/5.0', accept: 'text/html,*/*' },
+    })
+    if (res.status >= 200 && res.status < 300) return true
+    // 不支持 HEAD 的站点按可达处理，交给正式抓取判定
+    if (res.status === 405 || res.status === 501) return true
+    const loc = res.headers.get('location') || ''
+    if (res.status >= 300 && res.status < 400 && loc) {
+      const from = new URL(u)
+      const to = new URL(loc, u)
+      return to.host === from.host
+    }
+    return false
+  } catch {
+    return false
+  }
 }
 
 function sleep(ms: number, signal?: AbortSignal) {
@@ -406,6 +452,8 @@ export async function runCrawlerWorkflow(params: {
       : 'auto'
     const allowedHosts = new Set(crawlHosts)
     let expandedHosts = 0
+    // 整站爬取：站点是否「只认带斜杠路径」，每个 origin 探活一次后记住，避免每页白等 20s 超时
+    const slashSticky: Map<string, boolean> = ((state.options as any).__slashSticky ??= new Map())
     const hostStats: Record<string, HostStat> = (state.stats && typeof state.stats === 'object' ? { ...(state.stats as any) } : {}) as Record<string, HostStat>
     ;(state.options as any).__runStats = hostStats
 
@@ -539,7 +587,57 @@ export async function runCrawlerWorkflow(params: {
 
       const t0 = Date.now()
       try {
-        const snapshot = await workerExecute(url, params.config, state.options as any, params.signal, state.session, proxyPool, params.emitLog, fastPath, state.task)
+        // 整站爬取：先确定该站子页的可用 URL 形态（带/不带尾斜杠），再正式抓
+        let crawlUrl = url
+        if (siteCrawl) {
+          const altSlash = toggleTrailingSlash(url)
+          if (altSlash) {
+            let originKey = ''
+            try {
+              originKey = new URL(url).origin
+            } catch {}
+            const sticky = originKey ? slashSticky.get(originKey) : undefined
+            if (sticky === true) {
+              crawlUrl = altSlash
+            } else if (sticky === undefined) {
+              const ua = params.pickUserAgent(params.config, params.taskPlan)
+              if (await probeReachableAbs(url, ua)) {
+                if (originKey) slashSticky.set(originKey, false)
+              } else if (await probeReachableAbs(altSlash, ua)) {
+                if (originKey) slashSticky.set(originKey, true)
+                crawlUrl = altSlash
+                params.emitLog('info', `Master：该站点子页只认带斜杠路径，后续自动改用 ${altSlash} 形态`)
+              }
+            }
+          }
+        }
+        const executePage = (targetUrl: string) =>
+          workerExecute(
+            targetUrl,
+            params.config,
+            state.options as any,
+            params.signal,
+            state.session,
+            proxyPool,
+            params.emitLog,
+            fastPath,
+            state.task,
+          )
+        const fetchWithSlashFallback = async () => {
+          try {
+            return await executePage(crawlUrl)
+          } catch (err) {
+            // 兜底：另一种斜杠形态再试一次
+            const alt = siteCrawl ? toggleTrailingSlash(crawlUrl) : ''
+            if (!alt) throw err
+            params.emitLog(
+              'warn',
+              `Master：${crawlUrl} 抓取失败（${String((err as any)?.message ?? err).slice(0, 60)}），改用 ${alt} 重试`,
+            )
+            return await executePage(alt)
+          }
+        }
+        const snapshot = await fetchWithSlashFallback()
         const dt = Date.now() - t0
         if (host) {
           const s = (hostStats[host] = hostStats[host] || { attempts: 0, ok: 0, fail: 0, timeTotalMs: 0 })
@@ -602,7 +700,14 @@ export async function runCrawlerWorkflow(params: {
         try {
           const pageUrlKb = String(snapshot.finalUrl || url)
           const pageText = extractPageText(snapshot.html, 8000)
-          if (pageText) {
+          const pageFlat = normalizeWhitespace(pageText)
+          // 整站爬取会命中 404/空壳页：正文过短或明显是错误页时不入知识库
+          const looksBroken =
+            pageFlat.length < 60 ||
+            /^(?:404|403|500)\b|not found|page not found|页面不存在|页面未找到|访问出错|nginx/i.test(
+              pageFlat.slice(0, 120),
+            )
+          if (pageText && !looksBroken) {
             const kbPages: any[] = ((state.options as any).__kbPages ??= [])
             // 内容去重：同一正文被不同 URL（跳转/规范化变体）抓到时只保留一条
             const kbTextSeen: Set<string> = ((state.options as any).__kbTextSeen ??= new Set())
@@ -670,9 +775,41 @@ export async function runCrawlerWorkflow(params: {
             const sameHostLinks = rankSiteLinks(
               extractSiteLinks(snapshot.html, pageUrl, { max: perPageMax, allowedHostnames: crawlHosts }),
             )
-            // auto：种子页几乎没有站内链接时视为“导航型站点”，把首页外链也纳入站点边界
-            const useLinked = crawlScope === 'linked' || (crawlScope === 'auto' && sameHostLinks.length <= 3)
+            // SPA / SSR 站点（Vue / Nuxt / React）：导航是 <div @click> 而不是 <a href>，
+            // 页面上站内链接几乎为 0 → 整站抓取会退化成“只爬一页”。
+            // 这里用 sitemap.xml / JS bundle 路由表补全页面清单（不启动浏览器，零渲染成本）。
             let links = sameHostLinks
+            if (sameHostLinks.length < 3) {
+              const routeCache: Map<string, string[]> = ((state.options as any).__routeCache ??= new Map())
+              const routeKey = (() => {
+                try {
+                  return new URL(pageUrl).origin
+                } catch {
+                  return pageUrl
+                }
+              })()
+              let extra = routeCache.get(routeKey)
+              if (!extra) {
+                extra = await discoverSiteRoutes(pageUrl, snapshot.html, {
+                  allowedHostnames: crawlHosts,
+                  max: perPageMax,
+                  userAgent: params.pickUserAgent(params.config, params.taskPlan),
+                  signal: params.signal,
+                }).catch(() => [] as string[])
+                if (extra.length >= 3) routeCache.set(routeKey, extra)
+              }
+              const known = new Set([...sameHostLinks, pageUrl, url])
+              const fresh = extra.filter((l) => !known.has(l))
+              if (fresh.length) {
+                links = rankSiteLinks([...sameHostLinks, ...fresh])
+                params.emitLog(
+                  'info',
+                  `Master：页内 <a> 站内链接仅 ${sameHostLinks.length} 条（疑似 SPA/Vue 站点），路由发现补入 ${fresh.length} 条页面`,
+                )
+              }
+            }
+            // auto：种子页几乎没有站内链接时视为“导航型站点”，把首页外链也纳入站点边界
+            const useLinked = crawlScope === 'linked' || (crawlScope === 'auto' && links.length <= 3)
             if (useLinked) {
               if (currentDepth === 0) {
                 const anyLinks = extractSiteLinks(snapshot.html, pageUrl, { max: perPageMax, allowAnyHost: true })

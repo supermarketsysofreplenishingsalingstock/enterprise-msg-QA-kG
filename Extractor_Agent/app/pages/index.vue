@@ -148,7 +148,12 @@
           <div class="company-options">
             <label class="company-check" title="爬取范围：1=只爬主页；2=分层精选（只抓最相关的 N 页）；3=爬全站；4=爬全站及全站外链站点（范围大，慎重选择）">
               爬取范围
-              <select v-model.number="crawlScopeMode" class="scope-select" :disabled="status === 'running'">
+              <select
+                v-model.number="crawlScopeMode"
+                class="scope-select"
+                :disabled="status === 'running'"
+                @change="scopeTouched = true"
+              >
                 <option :value="1">1 · 只爬主页</option>
                 <option :value="2">2 · 分层精选爬最相关页面</option>
                 <option :value="3">3 · 爬全站</option>
@@ -162,8 +167,10 @@
                 max="200"
                 class="input-field scope-pages"
                 :disabled="status === 'running'"
+                @change="scopeTouched = true"
               />
               <span v-if="crawlScopeMode >= 2" class="scope-hint">页</span>
+              <span class="scope-hint" title="该范围对「开始任务」中带网址的任务同样生效">（对「开始任务」也生效）</span>
             </label>
             <label class="company-check">
               <input v-model="collectAttachments" type="checkbox" />
@@ -767,11 +774,38 @@ const kbAutoExtract = ref(true)
 // 爬取范围：1=只爬主页 2=分层精选爬 N 页 3=爬全站 4=爬全站+外部链接站点（慎选）
 const crawlScopeMode = ref<1 | 2 | 3 | 4>(2)
 const crawlMaxPages = ref(45)
+// 用户是否主动动过范围控件（决定「开始任务」是否套用该范围）
+const scopeTouched = ref(false)
 watch(crawlScopeMode, (m) => {
   // 切到全站/全站+外链时，预算默认放大到 200；切回精选恢复 45
   if ((m === 3 || m === 4) && Number(crawlMaxPages.value) <= 45) crawlMaxPages.value = 200
   if (m === 2 && Number(crawlMaxPages.value) >= 200) crawlMaxPages.value = 45
 })
+
+/**
+ * 把「爬取范围」写进 options。
+ * 公司爬取与主任务入口共用，避免“选了全站但走的是另一条链路”导致只爬一页。
+ */
+function applyCrawlScopeOptions(scopeMode: number, scopePages: number, seedCount: number) {
+  const mode = Math.max(1, Math.min(4, Math.floor(Number(scopeMode) || 2)))
+  const pages = Math.max(1, Math.min(200, Math.floor(Number(scopePages) || 45)))
+  ;(options as any).crawlScopeMode = mode
+  if (mode === 1) {
+    // 只爬主页：每个种子抓首页一条
+    ;(options as any).siteCrawl = false
+    ;(options as any).pageMode = 'single'
+    ;(options as any).siteCrawlScope = 'host'
+    ;(options as any).maxPages = Math.max(1, seedCount)
+    ;(options as any).maxItems = Math.max(Number(options.maxItems ?? 0), seedCount)
+    return
+  }
+  ;(options as any).siteCrawl = true
+  ;(options as any).pageMode = 'single'
+  ;(options as any).siteCrawlScope = mode === 4 ? 'linked' : 'host'
+  ;(options as any).maxPages = pages
+  ;(options as any).maxDepth = Math.max(Number((options as any).maxDepth ?? 0), mode === 2 ? 2 : 3)
+  ;(options as any).maxItems = Math.max(Number(options.maxItems ?? 0), Math.min(250, pages))
+}
 const companySearching = ref(false)
 const companyCandidates = ref<any[]>([])
 const companySearchMessage = ref('')
@@ -861,21 +895,7 @@ function startCompanyCrawl(crawlAll: boolean) {
   ;(options as any).companyTraits = traits
   ;(options as any).collectAttachments = collectAttachments.value
   ;(options as any).__kbAutoIngest = kbAutoExtract.value
-  ;(options as any).crawlScopeMode = scopeMode
-  if (scopeMode === 1) {
-    // 只爬主页：每个选中站点抓首页一条
-    ;(options as any).siteCrawl = false
-    ;(options as any).pageMode = 'single'
-    ;(options as any).siteCrawlScope = 'host'
-    ;(options as any).maxPages = Math.max(1, urls.length)
-    ;(options as any).maxItems = Math.max(Number(options.maxItems ?? 0), urls.length)
-  } else {
-    ;(options as any).siteCrawl = true
-    ;(options as any).pageMode = 'single'
-    ;(options as any).siteCrawlScope = scopeMode === 4 ? 'linked' : 'host'
-    ;(options as any).maxPages = scopePages
-    ;(options as any).maxDepth = Math.max(Number(options.maxDepth ?? 0), scopeMode === 2 ? 2 : 3)
-  }
+  applyCrawlScopeOptions(scopeMode, scopePages, urls.length)
   const scopeName = { 1: '只爬主页', 2: `分层精选（${scopePages} 页）`, 3: `全站（预算 ${scopePages} 页）`, 4: `全站+外部链接（预算 ${scopePages} 页，慎用）` }[scopeMode] || ''
   pushLog('info', `公司爬取：范围=${scopeName}；已选 ${urls.length} 个站点，开始任务`)
   start()
@@ -1138,6 +1158,15 @@ async function start() {
   logs.value = []
   result.value = null
   status.value = 'running'
+  // 主任务入口同样尊重「爬取范围」：任务里带网址且用户主动设过范围时，按范围注入站点抓取参数
+  const scopeMode = Number(crawlScopeMode.value) || 2
+  const scopePages = Math.max(1, Math.min(200, Math.floor(Number(crawlMaxPages.value) || 45)))
+  const urlsInTask = q.match(/https?:\/\/[^\s，,；;）)]+/gi) || []
+  if (scopeTouched.value && urlsInTask.length) {
+    applyCrawlScopeOptions(scopeMode, scopePages, urlsInTask.length)
+    const scopeName = { 1: '只爬主页', 2: `分层精选（${scopePages} 页）`, 3: `全站（预算 ${scopePages} 页）`, 4: `全站+外部链接（预算 ${scopePages} 页，慎用）` }[scopeMode] || ''
+    pushLog('info', `已应用爬取范围：${scopeName}`)
+  }
   const socket = ensureWs()
   if (!socket) {
     status.value = 'error'
