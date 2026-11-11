@@ -265,3 +265,9 @@ cd Extractor_Agent && pnpm install && pnpm dev   # :13104
 - **不勾选**：内容仍推送存为「待处理」（不调 LLM、秒级完成），日志提示存为待处理；之后在图谱页（:13105）点「**处理新增内容**」按钮补做抽取，按钮上会显示待处理条数
 
 对应环境变量：前端勾选状态按任务传 `options.__kbAutoIngest`；`KB_AUTO_INGEST=0` 仍为整个联动的总开关。
+
+> 2026-11-11 修复：该开关此前只在「公司爬取」入口写入 options，「**开始任务**」直接贴网址的链路漏传，
+> 后端 `options.__kbAutoIngest !== false` 会当成「开」，导致没勾也照样抽取。
+> 现在两条入口都在 `start()` 里统一调用 `applyKbIngestOptions()`；勾选状态用 localStorage
+> （`extractor_kb_auto_extract`）记住上次选择；日志会额外打一行「爬取后自动抽取：开/关」，
+> 未显式传值时推送日志标注为「自动抽取（未显式关闭，默认开）」，便于排查脚本直调 `/api/extract` 的场景。

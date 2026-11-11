@@ -250,7 +250,11 @@ export async function executeExtractRun(params: ExecuteExtractParams) {
     if (!companyName) {
       withMeta.meta = { ...withMeta.meta, kb_ingest: { ok: false, error: 'missing company name' } }
     } else {
-      const kbExtract = (options as any).__kbAutoIngest !== false
+      // 前端两条入口（公司爬取 / 开始任务）都会显式传 __kbAutoIngest；
+      // 未传时（如脚本直接调 /api/extract）沿用历史默认「开」，但日志里标注，避免与 UI 勾选状态对不上
+      const kbAutoIngestRaw = (options as any).__kbAutoIngest
+      const kbAutoIngestExplicit = typeof kbAutoIngestRaw === 'boolean'
+      const kbExtract = kbAutoIngestRaw !== false
       try {
         const kbUrl = env.kbServiceUrl.replace(/\/$/, '')
         const kbPayload = {
@@ -273,7 +277,9 @@ export async function executeExtractRun(params: ExecuteExtractParams) {
           type: 'log',
           payload: {
             level: 'info',
-            message: `知识库：推送「${companyName}」爬取内容到 ${kbUrl}（页面 ${kbPayload.pages.length} / 文件 ${kbPayload.files.length}，${kbExtract ? '自动抽取' : '存为待处理'}）`,
+            message: `知识库：推送「${companyName}」爬取内容到 ${kbUrl}（页面 ${kbPayload.pages.length} / 文件 ${kbPayload.files.length}，${
+              kbExtract ? (kbAutoIngestExplicit ? '自动抽取' : '自动抽取（未显式关闭，默认开）') : '存为待处理'
+            }）`,
             ts: Date.now(),
           },
         })

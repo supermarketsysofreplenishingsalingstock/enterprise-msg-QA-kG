@@ -179,6 +179,7 @@
             <label class="company-check" title="勾选：爬取完成后立即自动抽取关系/属性并更新图谱与 Wiki；不勾选：内容先存为待处理，之后在图谱页点「处理新增内容」">
               <input v-model="kbAutoExtract" type="checkbox" />
               爬取后自动抽取（知识库 / 图谱）
+              <span class="scope-hint" title="该开关对「开始任务」中带网址的任务同样生效">（对「开始任务」也生效）</span>
             </label>
             <button type="button" class="btn btn-secondary btn-small" @click="goKbUi">
               知识库 / 图谱界面
@@ -770,7 +771,18 @@ const companyName = ref('')
 const companyTraits = ref('')
 const collectAttachments = ref(true)
 // 爬取后是否自动抽取（不勾选时内容仍会存入知识库为「待处理」，可在图谱页手动处理）
+// 记住上次选择：首次访问沿用原默认（开），之后以用户最后一次勾选为准
+const KB_AUTO_EXTRACT_KEY = 'extractor_kb_auto_extract'
 const kbAutoExtract = ref(true)
+// 放到 onMounted 里读，避免 SSR 首屏与客户端状态不一致（hydration mismatch）
+onMounted(() => {
+  const saved = localStorage.getItem(KB_AUTO_EXTRACT_KEY)
+  if (saved === '0') kbAutoExtract.value = false
+  else if (saved === '1') kbAutoExtract.value = true
+})
+watch(kbAutoExtract, (v) => {
+  if (process.client) localStorage.setItem(KB_AUTO_EXTRACT_KEY, v ? '1' : '0')
+})
 // 爬取范围：1=只爬主页 2=分层精选爬 N 页 3=爬全站 4=爬全站+外部链接站点（慎选）
 const crawlScopeMode = ref<1 | 2 | 3 | 4>(2)
 const crawlMaxPages = ref(45)
@@ -805,6 +817,15 @@ function applyCrawlScopeOptions(scopeMode: number, scopePages: number, seedCount
   ;(options as any).maxPages = pages
   ;(options as any).maxDepth = Math.max(Number((options as any).maxDepth ?? 0), mode === 2 ? 2 : 3)
   ;(options as any).maxItems = Math.max(Number(options.maxItems ?? 0), Math.min(250, pages))
+}
+
+/**
+ * 把「爬取后自动抽取」写进 options。
+ * 公司爬取与主任务（开始任务）共用 —— 只在公司爬取里设置会漏传，
+ * 后端判定是 `options.__kbAutoIngest !== false`，字段缺失即当成「开」。
+ */
+function applyKbIngestOptions() {
+  ;(options as any).__kbAutoIngest = kbAutoExtract.value === true
 }
 const companySearching = ref(false)
 const companyCandidates = ref<any[]>([])
@@ -894,7 +915,7 @@ function startCompanyCrawl(crawlAll: boolean) {
   ;(options as any).companyName = name
   ;(options as any).companyTraits = traits
   ;(options as any).collectAttachments = collectAttachments.value
-  ;(options as any).__kbAutoIngest = kbAutoExtract.value
+  applyKbIngestOptions()
   applyCrawlScopeOptions(scopeMode, scopePages, urls.length)
   const scopeName = { 1: '只爬主页', 2: `分层精选（${scopePages} 页）`, 3: `全站（预算 ${scopePages} 页）`, 4: `全站+外部链接（预算 ${scopePages} 页，慎用）` }[scopeMode] || ''
   pushLog('info', `公司爬取：范围=${scopeName}；已选 ${urls.length} 个站点，开始任务`)
@@ -1167,6 +1188,14 @@ async function start() {
     const scopeName = { 1: '只爬主页', 2: `分层精选（${scopePages} 页）`, 3: `全站（预算 ${scopePages} 页）`, 4: `全站+外部链接（预算 ${scopePages} 页，慎用）` }[scopeMode] || ''
     pushLog('info', `已应用爬取范围：${scopeName}`)
   }
+  // 「爬取后自动抽取」对两条入口（公司爬取 / 开始任务）都生效
+  applyKbIngestOptions()
+  pushLog(
+    'info',
+    kbAutoExtract.value
+      ? '爬取后自动抽取：开（完成后同步抽取，耗时较长；可在图谱页看快照）'
+      : '爬取后自动抽取：关（内容存为待处理，可在图谱页点「处理新增内容」补做）',
+  )
   const socket = ensureWs()
   if (!socket) {
     status.value = 'error'
