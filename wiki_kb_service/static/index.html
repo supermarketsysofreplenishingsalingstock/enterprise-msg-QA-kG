@@ -753,7 +753,7 @@ function renderGraph(data){
       type:"graph",layout:"force",roam:true,draggable:true,
       categories:types.map(t=>({name:t})),
       data:eNodes,links:eEdges,
-      force:{repulsion:160,edgeLength:[40,120],gravity:0.08,layoutAnimation:true},
+      force:Object.assign({layoutAnimation:true},calcForce(graphNodes.length)),
       emphasis:{focus:"adjacency",lineStyle:{width:2.5},label:{show:true}},
       edgeSymbol:["none","arrow"],edgeSymbolSize:6,
       labelLayout:{hideOverlap:true},
@@ -767,6 +767,16 @@ function renderGraph(data){
     `实体 ${graphNodes.length}/${c.entities||0} · 关系 ${(data.edges||[]).length}/${c.triplets||0} · 文本块 ${c.chunks||0} · 快照 ${c.snapshots||0}`;
 }
 function nodeType(id){const n=graphNodes.find(n=>n.id===id);return n?n.type:""}
+// 力导向参数随节点数自动"撑开"：固定 repulsion:160 在节点一多时会挤成一团甚至重叠，
+// 这里以 30 节点为基准，节点越多斥力/边距越大、向心引力越小，避免节点面积重叠
+function calcForce(n){
+  const k=Math.pow(Math.max(n,10)/30,1.35);          // 相对 30 节点的拥挤倍数
+  const repulsion=Math.round(Math.min(2400,Math.max(180,180*k)));
+  const el0=Math.round(Math.min(80,Math.max(36,40*k)));   // 短边距
+  const el1=Math.round(Math.min(320,Math.max(100,110*k))); // 长边距
+  const gravity=+Math.max(0.015,0.08/Math.sqrt(k)).toFixed(4);
+  return{repulsion,edgeLength:[el0,el1],gravity};
+}
 function edgeName(id){const n=graphNodes.find(n=>n.id===id);return n?n.name:id}
 function edgePropsTip(edge){
   const p=edge&&edge.properties?Object.entries(edge.properties):[];
