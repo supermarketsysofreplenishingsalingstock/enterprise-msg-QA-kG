@@ -84,7 +84,7 @@ def build_llm() -> ThinkStripLLM:
         is_function_calling_model=False,
         temperature=config.LLM_TEMPERATURE,
         timeout=float(config.LLM_REQUEST_TIMEOUT),  # 注意：参数名是 timeout（request_timeout 会被忽略）
-        max_retries=2,
+        max_retries=max(0, config.LLM_MAX_RETRIES),
         context_window=config.LLM_CONTEXT_WINDOW,
         max_tokens=config.LLM_CONTEXT_WINDOW,
     )

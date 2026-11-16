@@ -247,7 +247,12 @@ function fmtElapsed(sec){
 function jobText(j){
   const p=j.progress||{};
   const st=j.status==="queued"?"排队中":(j.status==="running"?(p.stage||"运行中"):(j.status==="done"?"完成":"失败"));
-  const cnt=(p.total?`${p.done||0}/${p.total} · `:"");
+  let cnt="";
+  if(p.total){
+    cnt=`${p.done||0}/${p.total}`;
+    if(Number(p.fail)>0)cnt+=` · 成功${p.ok||0}/失败${p.fail}`;
+    cnt+=" · ";
+  }
   const el=(j.status==="running"||j.status==="queued")?fmtElapsed((Date.now()/1000)-(j.started_at||j.created_at)):fmtElapsed(j.elapsed);
   return `${j.kind==="reextract"?"重新抽取":"处理新增"}：${st} ${cnt}${el}`;
 }
@@ -303,11 +308,20 @@ function jobSummary(j){
     if(r.orphan_entities_removed)lines.push(`清理孤立实体 ${r.orphan_entities_removed}`);
     lines.push(`更新 Wiki 页 ${r.wiki_pages_updated||0}`);
   }else{
-    lines.push(`处理 chunk ${r.chunk_count||0}，新增三元组 ${r.triplet_count||0}`);
+    const ok=r.chunk_count||0;
+    const fail=Number(r.failed_count||0);
+    if(fail>0){
+      lines.push(`成功 ${ok} chunk，失败 ${fail} chunk（失败内容已保留待处理，可重试）`);
+    }else{
+      lines.push(`处理 chunk ${ok}，新增三元组 ${r.triplet_count||0}`);
+    }
+    lines.push(`新增三元组 ${r.triplet_count||0}`);
     lines.push(`更新 Wiki 页 ${r.wiki_pages_updated||0}`);
     if(r.remaining)lines.push(`剩余待处理 ${r.remaining}`);
   }
-  const msgs=[...(r.errors||[]),...(r.warnings||[])];
+  const errs=[...(r.extraction_errors||[]),...(r.errors||[])];
+  if(errs.length)lines.push("","抽取失败原因（前 3 条）：",...errs.slice(0,3));
+  const msgs=[...(r.warnings||[])];
   if(msgs.length)lines.push("","提示（原有数据已保留）：",...msgs.slice(0,3));
   return lines.join("\n");
 }
@@ -320,7 +334,9 @@ async function checkRunningJob(){
     if(j&&j.id!==watchingJobId){
       updateJobBadge(j);
       watchJob(j.id).then(async done=>{
-        alert("后台任务完成（"+done.company+"）\n\n"+jobSummary(done));
+        const f=Number((done.result||{}).failed_count||0);
+        const title=f>0?`后台任务部分完成（${f} chunk 失败，已保留待处理）`:"后台任务完成";
+        alert(title+"（"+done.company+"）\n\n"+jobSummary(done));
         await onCompanyChange();
       }).catch(e=>{updateJobBadge(null);alert("后台任务失败："+e.message)});
     }else if(!j&&!watchingJobId){
@@ -358,11 +374,16 @@ async function processPending(){
     b.textContent="后台处理中…";
     const job=await watchJob(d.job_id,j=>{
       const p=j.progress||{};
-      b.textContent=`后台处理中 ${p.done||0}/${p.total||0}`;
+      let t=`后台处理中 ${p.done||0}/${p.total||0}`;
+      if(Number(p.fail)>0)t+=` · 成功${p.ok||0}/失败${p.fail}`;
+      b.textContent=t;
     });
     const res=job.result||{};
     if(res.chunk_count===0)alert(res.message||"没有待处理的内容");
-    else alert("处理完成\n\n"+jobSummary(job));
+    else{
+      const f=Number(res.failed_count||0);
+      alert(f>0?`部分完成（${f} chunk 失败，已保留待处理）\n\n`+jobSummary(job):"处理完成\n\n"+jobSummary(job));
+    }
     await onCompanyChange();
   }catch(e){alert("处理新增内容失败："+e.message)}
   finally{b.disabled=false;b.textContent=old;refreshPending()}

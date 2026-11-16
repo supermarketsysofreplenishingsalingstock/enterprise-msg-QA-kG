@@ -57,4 +57,10 @@ if __name__ == "__main__":
     parser.add_argument("--force", action="store_true", help="若端口被占用，自动结束占用进程后启动")
     args = parser.parse_args()
     _check_port(args.host, args.port, args.force)
+    lim = config.describe_limits()
+    print(
+        f"[run] 抽取时间限制：单次请求超时 {lim['request_timeout']}s，重试 {lim['max_retries']} 次，"
+        f"并发 {lim['num_workers']} → 单 chunk 最坏 {lim['per_chunk_worst_sec'] // 60} 分钟"
+    )
+    print(f"[run] 配置来源 {config.BASE_DIR / '.env'}（改完必须重启本服务才生效）")
     uvicorn.run("app.main:app", host=args.host, port=args.port, reload=False)

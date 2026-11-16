@@ -133,7 +133,13 @@ class DiffRequest(BaseModel):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "llm": await llm_health(), "data_dir": str(config.DATA_DIR)}
+    return {
+        "ok": True,
+        "llm": await llm_health(),
+        # 当前生效的抽取时间限制（来自 .env，改完需重启服务）
+        "limits": config.describe_limits(),
+        "data_dir": str(config.DATA_DIR),
+    }
 
 
 @app.post("/api/ingest")

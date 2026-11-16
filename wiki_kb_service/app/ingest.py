@@ -349,9 +349,18 @@ async def run_process_pending(payload: dict, progress=None) -> dict:
     errors: list[str] = []
     done_ids: list[int] = []
     total = len(chunks)
+    ok_count = 0
+    fail_count = 0
     async with jobs.EXTRACT_LOCK:
         for i, cr in enumerate(chunks):
-            _p(done=i, total=total, stage="LLM 抽取中", current=f"chunk #{cr['chunk_id']}")
+            _p(
+                done=i,
+                total=total,
+                ok=ok_count,
+                fail=fail_count,
+                stage="LLM 抽取中",
+                current=f"chunk #{cr['chunk_id']}",
+            )
             crawl_time = str(cr.get("crawl_time") or graph_store.now_iso())
             err_before = len(errors)
             n = await _extract_chunk_to_graph(
@@ -366,11 +375,20 @@ async def run_process_pending(payload: dict, progress=None) -> dict:
                 errors=errors,
             )
             if len(errors) > err_before:
+                fail_count += 1
                 continue  # 失败的 chunk 保持待处理，下次可重试
+            ok_count += 1
             triplet_count += n
             done_ids.append(int(cr["chunk_id"]))
 
-    _p(done=total, total=total, stage="重建 Wiki 页面", current="")
+    _p(
+        done=total,
+        total=total,
+        ok=ok_count,
+        fail=fail_count,
+        stage="重建 Wiki 页面",
+        current="",
+    )
     graph_store.mark_chunks_processed(done_ids)
 
     # 快照三元组计数回填 + Wiki 重建
@@ -388,7 +406,8 @@ async def run_process_pending(payload: dict, progress=None) -> dict:
 
     wiki.append_log(
         company_slug,
-        f"处理新增内容：抽取 chunk {len(done_ids)}/{len(chunks)}，新增三元组 {triplet_count}，"
+        f"处理新增内容：chunk 成功 {len(done_ids)} / 失败 {len(chunks) - len(done_ids)}（共 {len(chunks)}），"
+        f"新增三元组 {triplet_count}，"
         f"更新实体页 {wiki_stats['pages_written']}"
         + (f"；抽取错误 {len(errors)} 条（保留待处理，可重试）" if errors else ""),
     )
@@ -399,6 +418,7 @@ async def run_process_pending(payload: dict, progress=None) -> dict:
         "company": company_name,
         "company_slug": company_slug,
         "chunk_count": len(done_ids),
+        "failed_count": total - len(done_ids),
         "triplet_count": triplet_count,
         "wiki_pages_updated": wiki_stats["pages_written"],
         "remaining": graph_store.count_unprocessed_chunks(company_id),

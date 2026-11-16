@@ -54,7 +54,12 @@ ONLINE_DEEPSEEK_API_KEY = _env("KB_ONLINE_DEEPSEEK_API_KEY", "")
 ONLINE_DEEPSEEK_MODEL = _env("KB_ONLINE_DEEPSEEK_MODEL", "deepseek-chat")
 
 LLM_TEMPERATURE = float(_env("KB_LLM_TEMPERATURE", "0.1") or 0.1)
+# 单次 LLM 请求超时（秒）。改这里就能改「抽取运行时间限制」：
+# 一个 chunk 要跑 2 次 LLM 调用（关系轮 + 属性轮），
+# 单 chunk 最坏耗时 ≈ LLM_REQUEST_TIMEOUT × (1 + LLM_MAX_RETRIES) × 2
 LLM_REQUEST_TIMEOUT = _env_int("KB_LLM_REQUEST_TIMEOUT", 600)
+# 失败重试次数（0=只试一次）。它与超时相乘，是「一个 chunk 卡多久」的另一个乘数
+LLM_MAX_RETRIES = _env_int("KB_LLM_MAX_RETRIES", 2)
 LLM_CONTEXT_WINDOW = _env_int("KB_LLM_CONTEXT_WINDOW", 16384)
 
 # ── 抽取参数（全部开放式，不预设 schema）──
@@ -92,6 +97,19 @@ def describe_llm() -> dict:
         "provider": LLM_PROVIDER,
         "model": get_llm_profile()["model"],
         "base_url": get_llm_profile()["base_url"],
+    }
+
+
+def describe_limits() -> dict:
+    """当前生效的「抽取运行时间限制」，用于启动日志 / 健康检查核对 .env 是否生效。"""
+    per_chunk_worst = LLM_REQUEST_TIMEOUT * (1 + max(0, LLM_MAX_RETRIES)) * 2
+    return {
+        "request_timeout": LLM_REQUEST_TIMEOUT,
+        "max_retries": LLM_MAX_RETRIES,
+        "num_workers": NUM_WORKERS,
+        "context_window": LLM_CONTEXT_WINDOW,
+        # 单 chunk 最坏耗时（秒）：2 次 LLM 调用 ×（1 次首试 + N 次重试）
+        "per_chunk_worst_sec": per_chunk_worst,
     }
 
 

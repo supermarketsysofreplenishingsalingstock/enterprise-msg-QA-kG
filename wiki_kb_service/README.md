@@ -34,14 +34,28 @@ python run.py
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `KB_LLM_PROVIDER` | `local_deepseek` | `local_deepseek` / `local_ministral` / `online_deepseek` |
-| `KB_LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI 兼容端点 |
-| `KB_LLM_MODEL` / `KB_LLM_API_KEY` | — | 模型名 / 密钥 |
-| `KB_LLM_REQUEST_TIMEOUT` | `600` | LLM 请求超时（秒） |
+| `KB_LOCAL_DEEPSEEK_BASE_URL` / `_MODEL` / `_API_KEY` | `http://localhost:11434/v1` / `deepseek-r1:14b` / `ollama` | 本地 DeepSeek（OpenAI 兼容端点） |
+| `KB_LOCAL_MINISTRAL_BASE_URL` / `_MODEL` / `_API_KEY` | `http://localhost:11434/v1` / `ministral-8b` / `ollama` | 本地 Ministral |
+| `KB_ONLINE_DEEPSEEK_BASE_URL` / `_MODEL` / `_API_KEY` | `https://api.deepseek.com/v1` / `deepseek-chat` / — | 线上 DeepSeek |
+| `KB_LLM_REQUEST_TIMEOUT` | `600` | **单次 LLM 请求超时（秒）**——改它即改抽取运行时间上限 |
+| `KB_LLM_MAX_RETRIES` | `2` | 失败重试次数（`0`=不重试），与超时相乘决定单 chunk 最坏耗时 |
 | `KB_PROPS_MODE` | `any` | 属性开放提取（`none` 则不提取属性，不建议） |
-| `KB_MAX_TRIPLETS_PER_CHUNK` | `25` | 每 chunk 最大三元组数 |
-| `KB_CHUNK_SIZE` / `KB_CHUNK_OVERLAP` | `1200` / `200` | 分块 |
+| `KB_MAX_TRIPLETS_PER_CHUNK` | `90` | 每 chunk 最大三元组数 |
+| `KB_CHUNK_SIZE` / `KB_CHUNK_OVERLAP` | `1200` / `150` | 分块 |
+| `KB_NUM_WORKERS` | `4` | 并行抽取 worker 数（本地单卡跑大模型建议 1–2） |
 | `KB_WIKI_SUMMARY_ENABLED` / `KB_WIKI_SUMMARY_MAX_ENTITIES` | `1` / `10` | 实体页 LLM 摘要 |
 | `KB_PORT` | `13105` | 服务端口 |
+
+**抽取时间上限的算法**：一个 chunk 要跑 2 次 LLM 调用（关系轮 + 属性轮），每次失败重试 `KB_LLM_MAX_RETRIES` 次，
+故 `单 chunk 最坏耗时 ≈ KB_LLM_REQUEST_TIMEOUT × (1 + KB_LLM_MAX_RETRIES) × 2`（默认 600×3×2 = 3600s）。
+改 `.env` 后**必须重启服务**（`python run.py --force`）才生效，启动日志会打印当前生效值：
+
+```
+[run] 抽取时间限制：单次请求超时 600s，重试 2 次，并发 4 → 单 chunk 最坏 60 分钟
+```
+
+也可随时查 `GET /api/health` 的 `limits` 字段核对。注意爬虫侧推送 `/api/ingest` 的请求超时固定 900s，
+超出后爬虫日志报失败但知识库仍在后台继续抽取。
 
 ## API
 
