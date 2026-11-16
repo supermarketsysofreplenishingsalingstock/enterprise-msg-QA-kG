@@ -61,7 +61,7 @@ python run.py
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/ingest` | 爬虫回传统一入库（页面 + 文件），`dry_run:true` 只存原文不抽取 |
+| POST | `/api/ingest` | 爬虫回传统一入库（页面 + 文件 + 图片），`dry_run:true` 只存原文不抽取 |
 | GET | `/api/companies` | 已入库公司列表 |
 | GET | `/api/snapshots?company=` | 某公司的快照列表 |
 | GET | `/api/categories?company=` | 图谱类别（图例） |
@@ -69,7 +69,11 @@ python run.py
 | GET | `/api/graph/entity/{ekey}?company=` | 实体详情（属性 + 关系 + 来源） |
 | GET | `/api/graph/diff?company=&a=&b=` | 两个快照的三元组差异（新增/消失/变化） |
 | GET | `/api/wiki/pages` / `page` / `index` | Wiki 页面列表 / 内容 / 索引 |
-| GET | `/api/health` | 健康检查（含 LLM 探测） |
+| GET | `/api/images?company=&status=` | 图片登记列表（含 OCR/描述结果与状态统计） |
+| GET | `/api/images/{id}/file?company=` | 图片原文件（前端缩略图用） |
+| POST | `/api/process_images` | 处理全部待处理图片：OCR → 视觉描述 → 入图（后台 job） |
+| POST | `/api/reprocess_images` | 重新处理选中图片（先删旧三元组再重跑；后台 job） |
+| GET | `/api/health` | 健康检查（含 LLM 探测 + 抽取时间限制 + 图片模型） |
 
 ### /api/ingest 请求体
 
@@ -79,9 +83,30 @@ python run.py
   "crawl_time": "2026-10-13 19:00:00",
   "note": "第2次全站爬取",
   "pages":  [{ "url": "...", "title": "...", "text": "页面正文" }],
-  "files":  [{ "url": "...", "title": "...", "path": "已下载文件路径", "content_type": "application/pdf" }]
+  "files":  [{ "url": "...", "title": "...", "path": "已下载文件路径", "content_type": "application/pdf" }],
+  "images": [{ "url": "...", "title": "...", "path": "已下载图片路径", "content_type": "image/jpeg" }]
 }
 ```
+
+## 图片链路（仿「图谱与图片检索增强生成」）
+
+爬虫勾选「爬取图片」（默认勾选）→ 下载页面图片随 ingest 推送 → KB 登记（sha1 去重，
+落盘 `data/images/<公司slug>/`，过滤 <3KB 图标与短边 <96px 小图）→ 处理：
+
+1. **通道1 OCR**：本地 Ollama 的 PaddleOCR-VL（`KB_IMG_OCR_MODEL`）识别图中文字，
+   识别完立即卸载模型（`KB_IMG_OCR_KEEP_ALIVE=0`）给描述模型让显存；
+2. **通道2 图片简述**：多模态模型看图生成描述，`KB_IMG_DESCRIBE_PROVIDER` 二选一：
+   - `local_ministral`（默认）：本地 Ollama 的 `KB_IMG_DESCRIBE_MODEL`；
+   - `online`：OpenAI 兼容视觉端点（`KB_ONLINE_VISION_BASE_URL/_API_KEY/_MODEL`）；
+     注意 DeepSeek 官方 API 目前没有视觉模型，需指向任意支持图片输入的服务。
+   本地视觉模型显存不足时自动改纯 CPU 重试一次；online 失败回退本地；
+3. **入图**：把「图片简述 + 图中文字」交给与文本同一套 DynamicLLMPathExtractor 开放式
+   抽取，三元组带 `image_id`，可在「重新处理图片」时精确替换。
+
+触发方式：
+- 勾选「爬取后自动抽取」→ ingest/处理新增内容时自动处理图片；
+- 未勾选 → 图片保持待处理，图谱页点「处理新图片」或「重新处理图片…」（可勾选/全选）。
+处理很慢（本地 14B 视觉模型单张 30~60 分钟），所以独立成 job，不与文本处理混跑。
 
 `Extractor_Agent`（Nuxt 爬虫）在**公司爬取**结束后自动回调本接口（`KB_AUTO_INGEST=1`，默认开启；服务地址 `KB_SERVICE_URL`，默认 `http://127.0.0.1:13105`）。
 

@@ -93,9 +93,15 @@ export async function runCrawlerAgent(params: RunParams) {
     ;(params.options as any).__companyCrawl = true
     ;(params.options as any).__companyName = companyMode.companyName
     ;(params.options as any).__companyTraits = companyMode.traits
-    // 默认开启附件收集与整站模式（公司网站要尽量抓全）
+    // 默认开启附件收集、图片收集与整站模式（公司网站要尽量抓全）
     if ((params.options as any).collectAttachments === undefined) {
       ;(params.options as any).collectAttachments = true
+    }
+    if ((params.options as any).collectImages === undefined) {
+      ;(params.options as any).collectImages = true
+    }
+    if ((params.options as any).imageMax === undefined) {
+      ;(params.options as any).imageMax = 60
     }
     if (!(params.options as any).siteCrawl) {
       ;(params.options as any).siteCrawl = true

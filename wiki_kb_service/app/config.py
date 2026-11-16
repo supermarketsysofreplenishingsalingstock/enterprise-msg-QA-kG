@@ -79,6 +79,82 @@ WIKI_SUMMARY_ENABLED = _env("KB_WIKI_SUMMARY_ENABLED", "1") not in ("0", "false"
 # ── 爬虫回传 ──
 INGEST_TOKEN = _env("KB_INGEST_TOKEN", "")
 
+# ── 图片链路（仿「图谱与图片检索增强生成」：OCR 通道 + 视觉描述通道 + 入图）──
+IMAGE_DIR = DATA_DIR / "images"          # 图片落盘根目录（按公司 slug 分子目录）
+IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+# 通道1 OCR：本地 Ollama 里的 PaddleOCR-VL 视觉模型（支持汉字/字母/数字/符号）
+IMG_OCR_MODEL = _env("KB_IMG_OCR_MODEL", "enaval/PaddleOCR-VL-1.6-0.9B-Backup:latest")
+IMG_OCR_TIMEOUT = _env_int("KB_IMG_OCR_TIMEOUT", 600)
+IMG_OCR_KEEP_ALIVE = _env("KB_IMG_OCR_KEEP_ALIVE", "0")   # 0=识别完立即卸载，给描述模型让显存
+IMG_OCR_PROMPT = _env(
+    "KB_IMG_OCR_PROMPT",
+    "请识别图片中的所有文字（包括汉字、字母、数字、符号），按阅读顺序原样输出，"
+    "不要翻译、不要总结、不要添加不存在的内容。图中没有文字时只输出：无文字。",
+)
+
+# 通道2 图片简述：local_ministral（本地 Ollama 视觉）或 online（OpenAI 兼容视觉端点，用户可选）
+IMG_DESCRIBE_PROVIDER = _env("KB_IMG_DESCRIBE_PROVIDER", "local_ministral").lower()  # local_ministral | online
+IMG_DESCRIBE_MODEL = _env("KB_IMG_DESCRIBE_MODEL", "ministral-3:14b-instruct-2512-q8_0")
+IMG_DESCRIBE_TIMEOUT = _env_int("KB_IMG_DESCRIBE_TIMEOUT", 7200)   # 本地 14B 单张可能 30~60 分钟
+IMG_DESCRIBE_KEEP_ALIVE = _env("KB_IMG_DESCRIBE_KEEP_ALIVE", "2h")  # 批处理期间驻留，避免每张重新加载
+IMG_DESCRIBE_NUM_CTX = _env_int("KB_IMG_DESCRIBE_NUM_CTX", 2048)    # 小上下文减少 KV cache，缓解显存不足
+# 视觉调用失败（显存不足）时是否改用纯 CPU 重试一次（很慢但能跑通）
+IMG_DESCRIBE_CPU_RETRY = _env("KB_IMG_DESCRIBE_CPU_RETRY", "1") not in ("0", "false", "False")
+
+# online 视觉端点（OpenAI 兼容 /chat/completions，支持 image_url 的 base64 数据）。
+# 注意：DeepSeek 官方 API 目前没有视觉模型；需要视觉能力时把 BASE_URL/MODEL 指向
+# 任意 OpenAI 兼容视觉服务（如自建 vLLM 部署的 Qwen-VL、OpenRouter 的视觉模型等）。
+# 只填 API_KEY 不填 MODEL 时该通道视为未配置，自动回退本地 ministral。
+ONLINE_VISION_BASE_URL = _env("KB_ONLINE_VISION_BASE_URL", "https://api.deepseek.com/v1")
+ONLINE_VISION_API_KEY = _env("KB_ONLINE_VISION_API_KEY", "")
+ONLINE_VISION_MODEL = _env("KB_ONLINE_VISION_MODEL", "")
+
+IMG_DESCRIBE_PROMPT = _env(
+    "KB_IMG_DESCRIBE_PROMPT",
+    "请用中文简要描述这张图片：先说明它是什么类型的图（照片/文档截图/表格/图表/示意图等），"
+    "再概括主要内容与要点，3~5 句话。不要逐字罗列图中文字。",
+)
+
+# 送模型前把长边缩放到该值以内（控制显存与耗时）；小图/图标过滤
+IMG_MAX_SIDE = _env_int("KB_IMG_MAX_SIDE", 1568)
+IMG_MIN_BYTES = _env_int("KB_IMG_MIN_BYTES", 3072)
+IMG_MIN_SIDE = _env_int("KB_IMG_MIN_SIDE", 96)
+SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
+
+
+def get_img_describe_profile() -> dict:
+    """图片描述通道配置：provider / model / base_url / api_key。"""
+    if IMG_DESCRIBE_PROVIDER == "online" and ONLINE_VISION_MODEL:
+        return {
+            "provider": "online",
+            "model": ONLINE_VISION_MODEL,
+            "base_url": ONLINE_VISION_BASE_URL,
+            "api_key": ONLINE_VISION_API_KEY or "not-needed",
+        }
+    if IMG_DESCRIBE_PROVIDER == "online" and not ONLINE_VISION_MODEL:
+        # online 未配置模型 → 回退本地
+        return {
+            "provider": "local_ministral(online未配置回退)",
+            "model": IMG_DESCRIBE_MODEL,
+            "base_url": LOCAL_MINISTRAL_BASE_URL,
+            "api_key": LOCAL_MINISTRAL_API_KEY,
+        }
+    return {
+        "provider": "local_ministral",
+        "model": IMG_DESCRIBE_MODEL,
+        "base_url": LOCAL_MINISTRAL_BASE_URL,
+        "api_key": LOCAL_MINISTRAL_API_KEY,
+    }
+
+
+def describe_image_llm() -> dict:
+    """当前图片链路模型信息（健康检查 / 日志用）。"""
+    return {
+        "ocr_model": IMG_OCR_MODEL,
+        **get_img_describe_profile(),
+    }
+
 
 def resolve_props_mode() -> "list[str] | None":
     """返回传给 DynamicLLMPathExtractor 的 props 参数。

@@ -21,7 +21,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-from . import config, graph_store, jobs, wiki
+from . import config, graph_store, image_service, jobs, wiki
 from .extractor import chunk_text, extract_from_chunk, is_meaningful_triplet
 from .llm_factory import get_llm, config as cfg
 
@@ -227,6 +227,30 @@ async def run_ingest(payload: dict) -> dict:
             }
         )
 
+    # 爬虫下载的图片：登记（sha1 去重 + 复制到 data/images/<slug>/），不做任何模型调用；
+    # 是否 OCR/描述/入图由 do_extract 决定（对应前端「爬取后自动抽取」勾选）
+    images_payload = [im for im in (payload.get("images") or []) if isinstance(im, dict)]
+    new_images = 0
+    errors_img: list[str] = []
+    for im in images_payload:
+        src_path = str(im.get("path") or "")
+        if not src_path:
+            continue
+        try:
+            iid = image_service.register_image_file(
+                company_id=company_id,
+                company_slug=company_slug,
+                src_path=src_path,
+                url=str(im.get("url") or ""),
+                title=str(im.get("title") or ""),
+                snapshot_id=snapshot_id,
+                crawl_time=crawl_time,
+            )
+            if iid:
+                new_images += 1
+        except Exception as e:  # noqa: BLE001
+            errors_img.append(f"图片登记失败 {src_path}: {e}")
+
     # 2) 原始资料层落盘 + 登记
     for s in sources:
         p = wiki.save_raw_source(company_slug, snapshot_id, s["kind"], s["url"], s["title"], s["text"], crawl_time)
@@ -284,19 +308,41 @@ async def run_ingest(payload: dict) -> dict:
     else:
         wiki_stats = {"pages_written": 0, "summaries": 0}
 
+    # 6) 图片链路（勾选了自动处理建图 → 自动抽取时图片一起做 OCR/描述/入图；
+    #    未勾选则图片保持 pending，之后在图谱页点「处理新图片」或随「处理新增内容」补做）
+    image_result = None
+    if new_images:
+        if do_extract:
+            # /api/ingest 是同步请求（无后台 job），图片处理进度无法上报，只能跑完看结果
+            img = await _process_pending_images_if_any(
+                company_id=company_id, company_slug=company_slug, company_name=company_name,
+                progress=None, errors=errors,
+            )
+            image_result = img["result"]
+            errors.extend(errors_img)
+        else:
+            errors.extend(errors_img)
+
     wiki.append_log(
         company_slug,
         f"ingest 快照 {snapshot_id}：来源 页面{page_count}/文件{file_count}，chunk {len(chunk_rows)}，"
+        f"图片 新登记{new_images}"
         + (
-            f"新抽取三元组 {triplet_count}，更新实体页 {wiki_stats['pages_written']}"
+            f"，新抽取三元组 {triplet_count}，更新实体页 {wiki_stats['pages_written']}"
             if do_extract
-            else f"已存为待处理内容（未抽取，待处理 chunk {len(chunk_rows)}）"
+            else f"（未抽取，待处理 chunk {len(chunk_rows)}）"
+        )
+        + (
+            f"，图片 处理{image_result.get('processed', 0)}/失败{image_result.get('failed', 0)}"
+            if image_result
+            else ""
         )
         + f"；LLM={llm_desc}"
         + (f"；抽取错误 {len(errors)} 条" if errors else ""),
     )
     wiki.rebuild_index(company_slug, company_name)
 
+    img_stats = graph_store.image_stats(company_id)
     return {
         "ok": True,
         "company": company_name,
@@ -305,6 +351,9 @@ async def run_ingest(payload: dict) -> dict:
         "crawl_time": crawl_time,
         "page_count": page_count,
         "file_count": file_count,
+        "image_count": new_images,
+        "images": image_result,
+        "image_stats": img_stats,
         "chunk_count": len(chunk_rows),
         "triplet_count": triplet_count,
         "wiki_pages_updated": wiki_stats["pages_written"],
@@ -334,6 +383,11 @@ async def run_process_pending(payload: dict, progress=None) -> dict:
 
     chunks = graph_store.get_unprocessed_chunks(company_id, limit=limit)
     if not chunks:
+        errors: list[str] = []
+        img = await _process_pending_images_if_any(
+            company_id=company_id, company_slug=company_slug, company_name=company_name,
+            progress=_p, errors=errors,
+        )
         return {
             "ok": True,
             "company": company_name,
@@ -341,8 +395,9 @@ async def run_process_pending(payload: dict, progress=None) -> dict:
             "chunk_count": 0,
             "triplet_count": 0,
             "wiki_pages_updated": 0,
-            "extraction_errors": [],
-            "message": "没有待处理的内容",
+            "images": img["result"],
+            "extraction_errors": errors[:10],
+            "message": "没有待处理的文本内容" + ("（已处理待处理图片）" if img["result"] else ""),
         }
 
     triplet_count = 0
@@ -404,11 +459,19 @@ async def run_process_pending(payload: dict, progress=None) -> dict:
     latest = graph_store.latest_snapshot_id(company_id) or chunks[0]["snapshot_id"]
     wiki_stats = await regenerate_wiki_pages(company_slug, company_name, company_id, latest, with_summary=True)
 
+    # 处理新增内容时连带处理待处理的图片（OCR + 视觉描述 + 入图）；
+    # 若没有待处理 chunk 但有新图片，也在这里一并处理
+    image_stats = await _process_pending_images_if_any(
+        company_id=company_id, company_slug=company_slug, company_name=company_name,
+        progress=_p, errors=errors,
+    )
+
     wiki.append_log(
         company_slug,
         f"处理新增内容：chunk 成功 {len(done_ids)} / 失败 {len(chunks) - len(done_ids)}（共 {len(chunks)}），"
         f"新增三元组 {triplet_count}，"
         f"更新实体页 {wiki_stats['pages_written']}"
+        + image_stats["log"]
         + (f"；抽取错误 {len(errors)} 条（保留待处理，可重试）" if errors else ""),
     )
     wiki.rebuild_index(company_slug, company_name)
@@ -422,7 +485,36 @@ async def run_process_pending(payload: dict, progress=None) -> dict:
         "triplet_count": triplet_count,
         "wiki_pages_updated": wiki_stats["pages_written"],
         "remaining": graph_store.count_unprocessed_chunks(company_id),
+        "images": image_stats["result"],
         "extraction_errors": errors[:10],
+    }
+
+
+async def _process_pending_images_if_any(
+    *, company_id: int, company_slug: str, company_name: str, progress=None, errors: list[str]
+) -> dict:
+    """有待处理图片就顺带处理（勾选了自动处理建图时，图片在这里补做）。"""
+    from . import image_service
+
+    pending_img = graph_store.image_stats(company_id).get("pending") or 0
+    if not pending_img:
+        return {"log": "", "result": None}
+    if progress:
+        progress(done=0, total=pending_img, stage="处理待处理图片", current="")
+    img_res = await image_service.run_process_images(
+        company_id=company_id,
+        company_slug=company_slug,
+        company_name=company_name,
+        image_ids=None,
+        reprocess=False,
+        progress=progress,
+    )
+    if img_res.get("extraction_errors"):
+        errors.extend(img_res["extraction_errors"])
+    return {
+        "log": f"；图片 处理 {img_res.get('processed', 0)} / 失败 {img_res.get('failed', 0)}，"
+        f"图片入图三元组 {img_res.get('triplet_count', 0)}",
+        "result": {k: img_res.get(k) for k in ("processed", "failed", "triplet_count")},
     }
 
 

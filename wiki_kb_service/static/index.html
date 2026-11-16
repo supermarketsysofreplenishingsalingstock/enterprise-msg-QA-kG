@@ -95,6 +95,14 @@
   .chunk-item{display:flex;gap:10px;padding:9px 8px;border-bottom:1px solid var(--line);font-size:12.5px;align-items:flex-start;cursor:pointer}
   .chunk-item:hover{background:var(--panel2)}
   .chunk-item input{margin-top:3px}
+  /* 图片列表（重新处理图片弹窗） */
+  .img-row{display:flex;gap:10px;padding:9px 8px;border-bottom:1px solid var(--line);font-size:12.5px;align-items:flex-start}
+  .img-row:hover{background:var(--panel2)}
+  .img-row input{margin-top:24px}
+  .img-thumb{width:84px;height:64px;object-fit:cover;border-radius:6px;border:1px solid var(--line);flex:none;background:var(--panel2)}
+  .img-meta{flex:1;min-width:0}
+  .img-name{color:#e8eef5;font-weight:600;margin-bottom:3px;word-break:break-all}
+  .img-sub{color:var(--muted);font-size:11.5px;line-height:1.6;word-break:break-all}
   .chunk-meta{color:var(--muted);font-size:11.5px;margin-bottom:4px;line-height:1.6}
   .chunk-snip{color:#b9c7d6;line-height:1.55;word-break:break-all}
   .badge{padding:1px 6px;border-radius:4px;font-size:11px;border:1px solid var(--line);color:var(--muted);margin-left:6px;white-space:nowrap}
@@ -129,6 +137,8 @@
     <button onclick="loadGraph()">刷新</button>
     <button id="btnPending" onclick="processPending()" title="抽取尚未处理的爬取内容（未勾选「自动抽取」时积累的内容在此补做）">处理新增内容</button>
     <button id="btnReextract" onclick="openReextract()" title="勾选已有内容并重新抽取（抽取规则升级后刷新旧数据）">重新抽取…</button>
+    <button id="btnImages" onclick="processNewImages()" title="处理全部待处理图片：先 PaddleOCR 识别图中文字，再视觉模型生成图片简述，最后并入知识图谱。处理很慢（本地视觉模型单张可达 30~60 分钟），后台运行可关页面">处理新图片</button>
+    <button onclick="openImageModal()" title="查看已登记图片，勾选后重新处理（重跑 OCR/描述，旧三元组会被替换）">重新处理图片…</button>
     <span id="jobBadge" style="display:none;font-size:12px;padding:3px 8px;border:1px solid #5b4527;border-radius:5px;color:var(--warn);white-space:nowrap"></span>
   </div>
   <div class="tools" id="diffTools" style="display:none">
@@ -187,6 +197,30 @@
   </div>
 </div>
 
+<div class="modal-mask" id="imagesModal">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        重新处理选中的图片
+        <span class="hint">勾选图片后重跑「OCR → 视觉描述 → 入图」：先删除这些图片旧的三元组，新结果产生后才替换（不会出现"旧的没了新的也没来"）。处理很慢（本地视觉模型单张 30~60 分钟），任务在后台运行，可以关闭页面稍后回来看进度。</span>
+      </div>
+      <button onclick="closeImageModal()">×</button>
+    </div>
+    <div class="modal-tools">
+      <button onclick="toggleAllImages(true)">全选</button>
+      <button onclick="toggleAllImages(false)">取消全选</button>
+      <span id="imageCountLabel">0 张</span>
+      <span style="margin-left:auto" id="imageStatsLabel"></span>
+    </div>
+    <div class="chunk-list" id="imageList"></div>
+    <div class="modal-foot">
+      <span class="status" id="imagesStatus"></span>
+      <button onclick="closeImageModal()">关闭</button>
+      <button class="primary" id="btnDoImages" onclick="doReprocessImages()">重新处理选中的图片</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const API = "";
 let chart = null;
@@ -230,6 +264,7 @@ async function onCompanyChange(){
   selCat.innerHTML=`<option value="">全部类别</option>`+
     (catD.categories||[]).map(c=>`<option value="${esc(c.category)}">${esc(c.category)}（${c.count}）</option>`).join("");
   refreshPending();
+  refreshImages();
   checkRunningJob();
   loadGraph();
   // 切换公司后清掉上一家的问答结果，避免串台
@@ -254,7 +289,8 @@ function jobText(j){
     cnt+=" · ";
   }
   const el=(j.status==="running"||j.status==="queued")?fmtElapsed((Date.now()/1000)-(j.started_at||j.created_at)):fmtElapsed(j.elapsed);
-  return `${j.kind==="reextract"?"重新抽取":"处理新增"}：${st} ${cnt}${el}`;
+  const kindName={reextract:"重新抽取",process_pending:"处理新增",process_images:"处理图片",reprocess_images:"重新处理图片"}[j.kind]||j.kind;
+  return `${kindName}：${st} ${cnt}${el}`;
 }
 function updateJobBadge(j){
   const b=document.getElementById("jobBadge");
@@ -302,7 +338,13 @@ function watchJob(jobId,onTick){
 function jobSummary(j){
   const r=j.result||{};
   const lines=[];
-  if(j.kind==="reextract"){
+  if(j.kind==="process_images"||j.kind==="reprocess_images"){
+    lines.push(`图片 处理成功 ${r.processed||0} / 失败 ${r.failed||0}`);
+    lines.push(`图片入图三元组 ${r.triplet_count||0}`);
+    if(r.describe_provider)lines.push(`描述通道 ${r.describe_provider}（${r.describe_model||""}）`);
+    if(r.ocr_model)lines.push(`OCR 模型 ${r.ocr_model}`);
+    if(r.message)lines.push(r.message);
+  }else if(j.kind==="reextract"){
     lines.push(`选中 ${r.selected_chunks||0} 条，替换成功 ${r.chunk_count||0} 条`);
     lines.push(`删除旧三元组 ${r.deleted_triplets||0}，写入新三元组 ${r.triplet_count||0}`);
     if(r.orphan_entities_removed)lines.push(`清理孤立实体 ${r.orphan_entities_removed}`);
@@ -334,8 +376,10 @@ async function checkRunningJob(){
     if(j&&j.id!==watchingJobId){
       updateJobBadge(j);
       watchJob(j.id).then(async done=>{
-        const f=Number((done.result||{}).failed_count||0);
-        const title=f>0?`后台任务部分完成（${f} chunk 失败，已保留待处理）`:"后台任务完成";
+        const rr=done.result||{};
+        const f=Number(rr.failed_count||rr.failed||0);
+        const unit=done.kind==="process_images"||done.kind==="reprocess_images"?"张图片":"chunk";
+        const title=f>0?`后台任务部分完成（${f} ${unit} 失败，可重试）`:"后台任务完成";
         alert(title+"（"+done.company+"）\n\n"+jobSummary(done));
         await onCompanyChange();
       }).catch(e=>{updateJobBadge(null);alert("后台任务失败："+e.message)});
@@ -387,6 +431,143 @@ async function processPending(){
     await onCompanyChange();
   }catch(e){alert("处理新增内容失败："+e.message)}
   finally{b.disabled=false;b.textContent=old;refreshPending()}
+}
+
+// ── 图片链路（OCR → 视觉描述 → 入图；仿「图谱与图片检索增强生成」）──
+let imageCache=[], selectedImageIds=new Set();
+function imgStatusBadge(s){
+  const map={pending:["待处理","warn"],processing:["处理中","warn"],processed:["已处理",""],failed:["失败","warn"]};
+  const [t,cls]=map[s]||[s,""];
+  return `<span class="badge ${cls}">${t}</span>`;
+}
+async function refreshImages(){
+  if(!currentCompany)return;
+  const b=document.getElementById("btnImages");
+  try{
+    const d=await getJSON(`${API}/api/images?company=${encodeURIComponent(currentCompany)}`);
+    const n=(d.stats||{}).pending||0;
+    b.textContent=n?`处理新图片（${n} 张待处理）`:"处理新图片";
+    b.style.fontWeight=n?"700":"";
+    b.style.color=n?"var(--accent,#f0a132)":"";
+  }catch(e){/* 静默 */}
+}
+async function processNewImages(){
+  if(!currentCompany){alert("请先选择公司");return}
+  const b=document.getElementById("btnImages");
+  const old=b.textContent;
+  b.disabled=true;b.textContent="已提交…";
+  try{
+    const r=await fetch(`${API}/api/process_images`,{
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({company:currentCompany}),
+    });
+    const d=await r.json().catch(()=>null);
+    if(!r.ok||!d||!d.ok)throw new Error((d&&d.detail)||("HTTP "+r.status));
+    if(!d.pending){alert("没有待处理的图片（图片随爬取内容自动登记；确认爬取时勾选了「爬取图片」）");return}
+    if(!confirm(`将对 ${d.pending} 张待处理图片执行「OCR → 视觉描述 → 入图」：\n\n· 处理很慢（本地视觉模型单张可达 30~60 分钟）\n· 任务在服务端后台运行，可以关闭页面稍后回来看进度\n\n继续？`))return;
+    b.textContent="后台处理中…";
+    const job=await watchJob(d.job_id,j=>{
+      const p=j.progress||{};
+      let t=`后台处理中 ${p.done||0}/${p.total||0}`;
+      if(p.stage)t+=` · ${p.stage}`;
+      if(Number(p.fail)>0)t+=` · 成功${p.ok||0}/失败${p.fail}`;
+      b.textContent=t;
+    });
+    const f=Number((job.result||{}).failed||0);
+    alert(f>0?`图片处理部分完成（${f} 张失败，可重试）\n\n`+jobSummary(job):"图片处理完成\n\n"+jobSummary(job));
+    await onCompanyChange();
+  }catch(e){alert("处理新图片失败："+e.message)}
+  finally{b.disabled=false;b.textContent=old;refreshImages()}
+}
+async function openImageModal(){
+  if(!currentCompany){alert("请先选择公司");return}
+  document.getElementById("imagesModal").style.display="flex";
+  selectedImageIds=new Set();
+  loadImageList();
+}
+function closeImageModal(){
+  document.getElementById("imagesModal").style.display="none";
+}
+async function loadImageList(){
+  const box=document.getElementById("imageList");
+  const statsLabel=document.getElementById("imageStatsLabel");
+  try{
+    const d=await getJSON(`${API}/api/images?company=${encodeURIComponent(currentCompany)}`);
+    imageCache=d.images||[];
+    const s=d.stats||{};
+    statsLabel.textContent=`共 ${s.total||0} 张 · 已处理 ${s.processed||0} · 待处理 ${s.pending||0} · 失败 ${s.failed||0}`;
+    if(!imageCache.length){
+      box.innerHTML=`<div class="empty-hint">该公司暂无图片<br/>图片随爬取内容自动登记（爬虫端勾选「爬取图片」）</div>`;
+      updateImageCountLabel();return;
+    }
+    box.innerHTML=imageCache.map(im=>{
+      const inGraph=im.status==="processed";
+      return `<div class="img-row">
+        <input type="checkbox" class="img-check" data-id="${esc(im.id)}" onchange="onImgCheck(this)" />
+        <img class="img-thumb" loading="lazy" src="${API}/api/images/${esc(im.id)}/file?company=${encodeURIComponent(currentCompany)}"
+             onerror="this.style.display='none'" />
+        <div class="img-meta">
+          <div class="img-name" title="${esc(im.url||"")}">${esc(im.name||im.id.slice(0,8))} ${imgStatusBadge(im.status)}</div>
+          <div class="img-sub">${esc((im.url||"").slice(0,90))}</div>
+          ${im.description?`<div class="img-sub">简述：${esc(im.description.slice(0,120))}…</div>`:""}
+          ${im.ocr_text?`<div class="img-sub">图中文字 ${im.ocr_text.length} 字</div>`:""}
+          ${im.error?`<div class="img-sub" style="color:var(--warn)">错误：${esc(im.error.slice(0,120))}</div>`:""}
+        </div>
+      </div>`;
+    }).join("");
+  }catch(e){
+    box.innerHTML=`<div class="empty-hint">图片列表加载失败：${esc(e.message)}</div>`;
+  }
+  updateImageCountLabel();
+}
+function onImgCheck(cb){
+  if(cb.checked)selectedImageIds.add(cb.dataset.id);
+  else selectedImageIds.delete(cb.dataset.id);
+  updateImageCountLabel();
+}
+function toggleAllImages(all){
+  document.querySelectorAll("#imageList .img-check").forEach(cb=>{
+    cb.checked=all;
+    if(all)selectedImageIds.add(cb.dataset.id);
+    else selectedImageIds.delete(cb.dataset.id);
+  });
+  updateImageCountLabel();
+}
+function updateImageCountLabel(){
+  document.getElementById("imageCountLabel").textContent=`${selectedImageIds.size} 张`;
+  const b=document.getElementById("btnDoImages");
+  if(!b.disabled)b.textContent=selectedImageIds.size?`重新处理选中的图片（${selectedImageIds.size} 张）`:"重新处理选中的图片";
+}
+async function doReprocessImages(){
+  const ids=[...selectedImageIds];
+  if(!ids.length){alert("请先勾选要重新处理的图片");return}
+  if(!confirm(`将对选中的 ${ids.length} 张图片重新处理：\n\n1) 先删除这些图片旧的三元组与识别结果\n2) 后台重跑 OCR → 视觉描述 → 入图（单张可达 30~60 分钟）\n3) 可以关闭页面稍后回来看进度\n\n继续？`))return;
+  const btn=document.getElementById("btnDoImages");
+  const status=document.getElementById("imagesStatus");
+  btn.disabled=true;btn.textContent="提交中…";
+  try{
+    const r=await fetch(`${API}/api/reprocess_images`,{
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({company:currentCompany,image_ids:ids}),
+    });
+    const d=await r.json().catch(()=>null);
+    if(!r.ok||!d||!d.ok)throw new Error((d&&d.detail)||("HTTP "+r.status));
+    btn.textContent="后台运行中…";
+    status.textContent="任务已提交，可在后台跑完后再回来查看";
+    const job=await watchJob(d.job_id,j=>{
+      const p=j.progress||{};
+      status.textContent=`处理中 ${p.done||0}/${p.total||0}${p.stage?" · "+p.stage:""}`;
+    });
+    alert("图片重新处理完成\n\n"+jobSummary(job));
+    closeImageModal();
+    await onCompanyChange();
+  }catch(e){
+    alert("重新处理失败："+e.message+"\n\n（原有数据未被删除，失败内容保留待重试）");
+  }finally{
+    btn.disabled=false;updateImageCountLabel();
+  }
 }
 
 // ── 重新抽取（用户勾选已有内容）──

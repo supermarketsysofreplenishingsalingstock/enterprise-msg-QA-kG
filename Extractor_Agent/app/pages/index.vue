@@ -176,6 +176,20 @@
               <input v-model="collectAttachments" type="checkbox" />
               下载站内挂载文件（PDF / DOCX / XLSX 等）
             </label>
+            <label class="company-check" title="勾选：爬取页面图片并登记到知识库（OCR 识别文字 + 视觉模型生成简述后并入图谱）。图片处理很慢，未勾选「爬取后自动抽取」时可在图谱页点「处理新图片」补做">
+              <input v-model="collectImages" type="checkbox" />
+              爬取图片（登记知识库 / 图谱）
+              <input
+                v-model.number="imageMax"
+                type="number"
+                min="0"
+                max="300"
+                class="input-field scope-pages"
+                :disabled="status === 'running'"
+                @change="scopeTouched = true"
+              />
+              <span class="scope-hint">张上限</span>
+            </label>
             <label class="company-check" title="勾选：爬取完成后立即自动抽取关系/属性并更新图谱与 Wiki；不勾选：内容先存为待处理，之后在图谱页点「处理新增内容」">
               <input v-model="kbAutoExtract" type="checkbox" />
               爬取后自动抽取（知识库 / 图谱）
@@ -185,6 +199,10 @@
               知识库 / 图谱界面
             </button>
             <button type="button" class="btn btn-secondary btn-small" title="在新窗口打开" @click="openKbUi">↗</button>
+          </div>
+          <!-- 搜索无结果也要在窗口里明确显示「未找到」，不能只写日志 -->
+          <div v-if="!companyCandidates.length && companySearchMessage" class="candidate-list company-not-found">
+            <div class="candidate-tip cand-miss">❌ {{ companySearchMessage }}</div>
           </div>
           <div v-if="companyCandidates.length" class="candidate-list">
             <div class="candidate-tip">{{ companySearchMessage || '请选择要爬取的网站（可多选）' }}</div>
@@ -770,18 +788,28 @@ const canSendFeedback = computed(() => {
 const companyName = ref('')
 const companyTraits = ref('')
 const collectAttachments = ref(true)
+// 爬取图片（默认勾选）：下载页面图片并登记到知识库；0 上限 = 不限制到 300 封顶
+const collectImages = ref(true)
+const imageMax = ref(60)
 // 爬取后是否自动抽取（不勾选时内容仍会存入知识库为「待处理」，可在图谱页手动处理）
 // 记住上次选择：首次访问沿用原默认（开），之后以用户最后一次勾选为准
 const KB_AUTO_EXTRACT_KEY = 'extractor_kb_auto_extract'
+const COLLECT_IMAGES_KEY = 'extractor_collect_images'
 const kbAutoExtract = ref(true)
 // 放到 onMounted 里读，避免 SSR 首屏与客户端状态不一致（hydration mismatch）
 onMounted(() => {
   const saved = localStorage.getItem(KB_AUTO_EXTRACT_KEY)
   if (saved === '0') kbAutoExtract.value = false
   else if (saved === '1') kbAutoExtract.value = true
+  const savedImg = localStorage.getItem(COLLECT_IMAGES_KEY)
+  if (savedImg === '0') collectImages.value = false
+  else if (savedImg === '1') collectImages.value = true
 })
 watch(kbAutoExtract, (v) => {
   if (process.client) localStorage.setItem(KB_AUTO_EXTRACT_KEY, v ? '1' : '0')
+})
+watch(collectImages, (v) => {
+  if (process.client) localStorage.setItem(COLLECT_IMAGES_KEY, v ? '1' : '0')
 })
 // 爬取范围：1=只爬主页 2=分层精选爬 N 页 3=爬全站 4=爬全站+外部链接站点（慎选）
 const crawlScopeMode = ref<1 | 2 | 3 | 4>(2)
@@ -915,6 +943,8 @@ function startCompanyCrawl(crawlAll: boolean) {
   ;(options as any).companyName = name
   ;(options as any).companyTraits = traits
   ;(options as any).collectAttachments = collectAttachments.value
+  ;(options as any).collectImages = collectImages.value === true
+  ;(options as any).imageMax = Math.max(0, Math.min(300, Math.floor(Number(imageMax.value) || 60)))
   applyKbIngestOptions()
   applyCrawlScopeOptions(scopeMode, scopePages, urls.length)
   const scopeName = { 1: '只爬主页', 2: `分层精选（${scopePages} 页）`, 3: `全站（预算 ${scopePages} 页）`, 4: `全站+外部链接（预算 ${scopePages} 页，慎用）` }[scopeMode] || ''
@@ -1190,11 +1220,20 @@ async function start() {
   }
   // 「爬取后自动抽取」对两条入口（公司爬取 / 开始任务）都生效
   applyKbIngestOptions()
+  // 「爬取图片」同样对两条入口生效（默认开；上限随任务下发）
+  ;(options as any).collectImages = collectImages.value === true
+  ;(options as any).imageMax = Math.max(0, Math.min(300, Math.floor(Number(imageMax.value) || 60)))
   pushLog(
     'info',
     kbAutoExtract.value
       ? '爬取后自动抽取：开（完成后同步抽取，耗时较长；可在图谱页看快照）'
       : '爬取后自动抽取：关（内容存为待处理，可在图谱页点「处理新增内容」补做）',
+  )
+  pushLog(
+    'info',
+    collectImages.value
+      ? `爬取图片：开（每页最多 12 张，总上限 ${options.imageMax} 张；登记后在图谱页处理）`
+      : '爬取图片：关',
   )
   const socket = ensureWs()
   if (!socket) {
@@ -1993,6 +2032,17 @@ body {
   font-size: 12px;
   color: var(--text-dim);
   margin-bottom: 8px;
+}
+
+/* 公司官网「未找到」提示：醒目但不闪烁（用户要求无动画） */
+.company-not-found {
+  border-color: rgba(240, 161, 50, 0.45);
+}
+
+.cand-miss {
+  color: #f0a132;
+  font-weight: 600;
+  margin-bottom: 0;
 }
 
 .candidate-row {

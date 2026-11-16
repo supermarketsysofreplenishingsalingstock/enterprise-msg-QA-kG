@@ -23,8 +23,9 @@ import {
 import { buildSeedFirstPlan, applyCrawlIntent, detectCrawlIntent } from '../services/crawlerAgentFrontload'
 import { uniqByUrl, extractDoubanTop250ListPage, extractJdPhbListPage, extractGenericListPage } from './extract/generic'
 import { extractSiteLinks, rankSiteLinks, extractAttachmentLinks } from './extract/siteLinks'
+import { extractImageLinks } from './extract/imageLinks'
 import { discoverSiteRoutes } from './extract/siteRoutes'
-import { downloadAttachment, extractPageText } from './fetch/fileDownload'
+import { downloadAttachment, downloadImage, extractPageText } from './fetch/fileDownload'
 import { type StructuredTaskPlan } from '../services/crawlerAgentTaskPlanning'
 import { formatItemsByOutputSpec } from './verify/qualityGate'
 import { runVerifierRetries } from './verify/postRun'
@@ -766,6 +767,58 @@ export async function runCrawlerWorkflow(params: {
           }
         }
 
+        // 爬取图片（默认开）：收集页面 <img> 图片 → 下载落盘 → 随爬取结果推送知识库
+        // 登记（sha1 去重），由知识库按「自动抽取」开关决定何时 OCR/描述/入图
+        const collectImages = (state.options as any)?.collectImages !== false
+        if (collectImages) {
+          try {
+            const pageUrlImg = String(snapshot.finalUrl || url)
+            const imgDir = path.join(
+              process.cwd(),
+              '.data',
+              'images',
+              String((state.options as any).__imageRunId ?? Date.now().toString(36)),
+            )
+            if (!(state.options as any).__imageRunId) {
+              ;(state.options as any).__imageRunId = Date.now().toString(36)
+              ;(state.options as any).__imageDir = imgDir
+            }
+            const imgSeen: Set<string> = ((state.options as any).__imageSeenUrls ??= new Set())
+            const imgBudget: any[] = ((state.options as any).__kbImages ??= [])
+            const maxImages = Math.max(0, Number((state.options as any).imageMax ?? 60) || 60)
+            const imgs = extractImageLinks(snapshot.html, pageUrlImg, {
+              max: 12,
+              allowedHostnames: crawlHosts,
+            })
+            let downloadedHere = 0
+            for (const im of imgs) {
+              if (imgBudget.length >= maxImages) break
+              if (imgSeen.has(im.url)) continue
+              imgSeen.add(im.url)
+              const f = await downloadImage(
+                im.url,
+                params.config,
+                params.signal,
+                (state.options as any).__imageDir ?? imgDir,
+                im.title,
+                imgBudget.length + 1,
+              )
+              if (f.ok) {
+                imgBudget.push(f)
+                downloadedHere += 1
+              }
+            }
+            if (downloadedHere > 0) {
+              params.emitLog(
+                'info',
+                `公司爬取：本页下载图片 ${downloadedHere} 张（累计 ${imgBudget.length}/${maxImages}）`,
+              )
+            }
+          } catch (e: any) {
+            params.emitLog('warn', `公司爬取：图片收集失败：${String(e?.message ?? e).slice(0, 120)}`)
+          }
+        }
+
         // 整站爬取：从当前页发现站内链接，按深度入队（BFS）
         if (siteCrawl && crawlHosts.length > 0) {
           const currentDepth = Number(depthMap[url] ?? 0)
@@ -1114,6 +1167,9 @@ export async function runCrawlerWorkflow(params: {
           0,
           Math.max(60, Math.min(500, Number((mergedOptions as any).__crawlMaxPages ?? 0) + 20)),
         )
+      : [],
+    images: Array.isArray((mergedOptions as any).__kbImages)
+      ? (mergedOptions as any).__kbImages
       : [],
     output: { format: params.taskPlan.outputSpec.format, content: formattedOutput },
     quality: evalResult.quality,

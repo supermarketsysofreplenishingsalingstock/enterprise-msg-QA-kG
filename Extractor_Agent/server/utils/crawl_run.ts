@@ -272,12 +272,21 @@ export async function executeExtractRun(params: ExecuteExtractParams) {
               content_type: f.contentType,
               size: f.size,
             })),
+          images: (Array.isArray((withMeta as any).images) ? (withMeta as any).images : [])
+            .filter((f: any) => f?.ok && f?.path)
+            .map((f: any) => ({
+              url: f.url,
+              title: f.filename,
+              path: f.path,
+              content_type: f.contentType,
+              size: f.size,
+            })),
         }
         emit?.({
           type: 'log',
           payload: {
             level: 'info',
-            message: `知识库：推送「${companyName}」爬取内容到 ${kbUrl}（页面 ${kbPayload.pages.length} / 文件 ${kbPayload.files.length}，${
+            message: `知识库：推送「${companyName}」爬取内容到 ${kbUrl}（页面 ${kbPayload.pages.length} / 文件 ${kbPayload.files.length} / 图片 ${kbPayload.images.length}，${
               kbExtract ? (kbAutoIngestExplicit ? '自动抽取' : '自动抽取（未显式关闭，默认开）') : '存为待处理'
             }）`,
             ts: Date.now(),

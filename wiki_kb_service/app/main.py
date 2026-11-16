@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from . import config, graph_service, graph_store, jobs, retrieval, wiki
+from . import config, graph_service, graph_store, image_service, jobs, retrieval, wiki
 from .ingest import run_ingest, run_process_pending, run_reextract
 from .llm_factory import llm_health
 
@@ -28,6 +28,7 @@ class IngestPayload(BaseModel):
     extract: bool = Field(True, description="False 时只存原始内容（待处理），不做 LLM 抽取")
     pages: list[dict] = Field(default_factory=list, description="[{url,title,text?,html?,excerpt?}]")
     files: list[dict] = Field(default_factory=list, description="[{url,title,path,content_type,size}]")
+    images: list[dict] = Field(default_factory=list, description="[{url,title,path,content_type,size}] 爬虫下载的图片（登记后按自动抽取开关处理）")
 
 
 class ProcessPendingPayload(BaseModel):
@@ -138,6 +139,8 @@ async def health():
         "llm": await llm_health(),
         # 当前生效的抽取时间限制（来自 .env，改完需重启服务）
         "limits": config.describe_limits(),
+        # 图片链路模型（OCR PaddleOCR-VL + 描述 provider/model）
+        "image_llm": config.describe_image_llm(),
         "data_dir": str(config.DATA_DIR),
     }
 
@@ -276,6 +279,103 @@ async def import_results(payload: ImportResultsPayload):
 @app.get("/api/companies")
 async def companies():
     return {"companies": graph_store.list_companies()}
+
+
+# ────────────────────────── 图片链路（仿「图谱与图片检索增强生成」） ──────────────────────────
+
+@app.get("/api/images")
+async def images(company: str = Query(...), status: str | None = Query(None)):
+    """某公司的图片登记列表（含 OCR/描述状态与结果）。"""
+    comp = graph_store.get_company_by_slug(_slug(company))
+    if not comp:
+        return {"company": company, "images": [], "stats": graph_store.image_stats(0)}
+    statuses = [s.strip() for s in status.split(",")] if status else None
+    return {
+        "company": str(comp["name"]),
+        "images": graph_store.list_images(int(comp["id"]), statuses),
+        "stats": graph_store.image_stats(int(comp["id"])),
+    }
+
+
+@app.get("/api/images/{image_id}/file")
+async def image_file(image_id: str, company: str = Query(...)):
+    """返回图片原文件（前端缩略图 / 预览用）。"""
+    comp = graph_store.get_company_by_slug(_slug(company))
+    if not comp:
+        raise HTTPException(status_code=404, detail="公司不存在")
+    row = graph_store.get_image(int(comp["id"]), image_id)
+    if not row or not row.get("file_path") or not Path(row["file_path"]).is_file():
+        raise HTTPException(status_code=404, detail="图片不存在")
+    return FileResponse(row["file_path"])
+
+
+class ProcessImagesPayload(BaseModel):
+    company: str = Field(..., description="公司名或 slug")
+    image_ids: list[str] = Field(default_factory=list, description="要处理的图片 id；空=全部待处理")
+
+
+@app.post("/api/process_images")
+async def process_images(payload: ProcessImagesPayload):
+    """处理新图片（OCR → 视觉描述 → 入图）。后台 job，关页面不影响。"""
+    comp = graph_store.get_company_by_slug(_slug(payload.company))
+    if not comp:
+        raise HTTPException(status_code=400, detail=f"公司不存在：{payload.company}")
+    running = jobs.running_for(str(comp["name"]))
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail=f"该公司已有任务在运行（{running['kind']}），请等它结束再提交",
+        )
+    stats = graph_store.image_stats(int(comp["id"]))
+    total = stats["pending"] if not payload.image_ids else len(payload.image_ids)
+    job = jobs.spawn(
+        kind="process_images",
+        company=str(comp["name"]),
+        meta={"image_ids": payload.image_ids, "reprocess": False},
+        total=total,
+        runner=lambda j: image_service.run_process_images(
+            company_id=int(comp["id"]),
+            company_slug=str(comp["slug"]),
+            company_name=str(comp["name"]),
+            image_ids=payload.image_ids or None,
+            reprocess=False,
+            progress=jobs.progress_setter(j),
+        ),
+    )
+    return JSONResponse({"ok": True, "job_id": job["id"], "pending": total,
+                         "message": "图片处理已在后台运行（很慢，可关闭页面稍后回来看进度）"})
+
+
+@app.post("/api/reprocess_images")
+async def reprocess_images(payload: ProcessImagesPayload):
+    """重新处理选中的图片：先删除旧的三元组与识别结果，再重跑 OCR/描述/入图。"""
+    comp = graph_store.get_company_by_slug(_slug(payload.company))
+    if not comp:
+        raise HTTPException(status_code=400, detail=f"公司不存在：{payload.company}")
+    if not payload.image_ids:
+        raise HTTPException(status_code=400, detail="重新处理需要先选中图片（image_ids 不能为空）")
+    running = jobs.running_for(str(comp["name"]))
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail=f"该公司已有任务在运行（{running['kind']}），请等它结束再提交",
+        )
+    job = jobs.spawn(
+        kind="reprocess_images",
+        company=str(comp["name"]),
+        meta={"image_ids": payload.image_ids, "reprocess": True},
+        total=len(payload.image_ids),
+        runner=lambda j: image_service.run_process_images(
+            company_id=int(comp["id"]),
+            company_slug=str(comp["slug"]),
+            company_name=str(comp["name"]),
+            image_ids=payload.image_ids,
+            reprocess=True,
+            progress=jobs.progress_setter(j),
+        ),
+    )
+    return JSONResponse({"ok": True, "job_id": job["id"], "pending": len(payload.image_ids),
+                         "message": "重新处理已在后台运行（旧三元组会在新结果产生后替换）"})
 
 
 @app.get("/api/categories")

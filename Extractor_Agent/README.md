@@ -219,11 +219,17 @@ npm run build
    - 恰好一个 → 自动进入 seed-first 模式爬取
 2. **条件/特征过滤**：`companyTraits` 会并入搜索 query，帮助定位更准确的官网
 3. **网站挂载文件下载**：抓取过程中自动收集页面挂载的 pdf/docx/xlsx/pptx/zip/txt/csv/ofd 等附件并下载（预算 `COMPANY_ATTACH_MAX`，默认 20 个）
-4. **自动入库**：公司爬取结束后，自动把页面文本 + 附件文本 POST 到 `wiki_kb_service` 的 `/api/ingest`，完成 LLM Wiki 三层落盘 + 开放式图谱抽取（`DynamicLLMPathExtractor`，不预设 schema、必提属性、宽松解析不丢三元组）
+4. **图片爬取（2026-11-16 新增，默认勾选）**：「爬取图片（登记知识库 / 图谱）」勾选项 +
+   张数上限（默认 60）。抓取时每页收集 `<img src/data-src/srcset>` 图片（每页最多 12 张，
+   过滤 data: URI / SVG / logo / icon / qrcode / 无扩展名动态图，只收站内域），下载到
+   `.data/images/<runId>/`，随 ingest 推送知识库登记（sha1 去重）。OCR / 视觉描述 / 入图
+   由知识库处理（见 wiki_kb_service README「图片链路」）
+5. **自动入库**：公司爬取结束后，自动把页面文本 + 附件文本 + 图片 POST 到 `wiki_kb_service` 的 `/api/ingest`，完成 LLM Wiki 三层落盘 + 开放式图谱抽取（`DynamicLLMPathExtractor`，不预设 schema、必提属性、宽松解析不丢三元组）
 
 ### 前端入口（app/pages/index.vue）
 
-- 任务区新增"公司信息爬取"面板：公司名、公司特征、`collectAttachments` 勾选、"搜索官网候选"按钮
+- 任务区新增"公司信息爬取"面板：公司名、公司特征、`collectAttachments` / `collectImages` 勾选、"搜索官网候选"按钮
+- 搜索官网候选**找不到时会直接在窗口中显示"❌ 未找到候选网站…"**（2026-11-16 修复：此前无候选时提示只写日志、界面不显示）
 - 候选澄清卡片：勾选候选网站后"爬取选中"或"全部爬取"
 - 结果区展示：附件下载列表、`kb_ingest` 入库状态（快照 id / 三元组数 / Wiki 页面数）、"知识库/图谱界面"跳转按钮
 

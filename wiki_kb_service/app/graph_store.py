@@ -143,6 +143,50 @@ def init_db() -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_triplets_chunk ON triplets(chunk_id)")
         except sqlite3.OperationalError:
             pass
+        # 图片链路：images 登记表 + image_graph 入图记录；triplets.image_id 标记来源图片
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS images(
+              id TEXT PRIMARY KEY,
+              company_id INTEGER NOT NULL,
+              name TEXT,
+              url TEXT,
+              file_path TEXT,
+              width INTEGER,
+              height INTEGER,
+              size INTEGER,
+              status TEXT DEFAULT 'pending',
+              ocr_text TEXT DEFAULT '',
+              ocr_model TEXT,
+              ocr_at TEXT,
+              description TEXT DEFAULT '',
+              describe_model TEXT,
+              describe_mode TEXT,
+              described_at TEXT,
+              snapshot_id TEXT,
+              crawl_time TEXT,
+              error TEXT,
+              created_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_images_company ON images(company_id, status);
+            CREATE TABLE IF NOT EXISTS image_graph(
+              company_id INTEGER NOT NULL,
+              image_id TEXT NOT NULL,
+              triplet_count INTEGER DEFAULT 0,
+              status TEXT DEFAULT 'processed',
+              processed_at TEXT,
+              UNIQUE(company_id, image_id)
+            );
+            """
+        )
+        try:
+            conn.execute("ALTER TABLE triplets ADD COLUMN image_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_triplets_image ON triplets(image_id)")
+        except sqlite3.OperationalError:
+            pass
 
 
 init_db()
@@ -305,13 +349,14 @@ def insert_triplet(
     source_title: str,
     source_kind: str,
     chunk_id: int | None = None,
+    image_id: str | None = None,
 ) -> None:
     with _lock, connect() as conn:
         conn.execute(
             "INSERT INTO triplets(company_id, snapshot_id, crawl_time, src_ekey, dst_ekey,"
             " src_name, dst_name, src_type, dst_type, relation, props_json,"
-            " source_url, source_title, source_kind, chunk_id, created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " source_url, source_title, source_kind, chunk_id, image_id, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 company_id,
                 snapshot_id,
@@ -328,6 +373,7 @@ def insert_triplet(
                 source_title,
                 source_kind,
                 chunk_id,
+                image_id,
                 now_iso(),
             ),
         )
@@ -744,3 +790,116 @@ def snapshot_ids_of_company(company_id: int) -> list[str]:
         return [r["snapshot_id"] for r in conn.execute(
             "SELECT snapshot_id FROM snapshots WHERE company_id=? ORDER BY crawl_time", (company_id,)
         ).fetchall()]
+
+
+# ────────────────────────── 图片链路（登记 / 状态 / 入图记录） ──────────────────────────
+
+def insert_image(
+    image_id: str,
+    company_id: int,
+    name: str,
+    url: str,
+    file_path: str,
+    width: int | None,
+    height: int | None,
+    size: int,
+    snapshot_id: str | None,
+    crawl_time: str | None,
+) -> bool:
+    """登记一张图片；同公司内容重复（同 sha1）返回 False。"""
+    with _lock, connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO images(id, company_id, name, url, file_path, width, height,"
+            " size, status, snapshot_id, crawl_time, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?, 'pending', ?, ?, ?)",
+            (image_id, company_id, name, url, file_path, width, height, size,
+             snapshot_id, crawl_time, now_iso()),
+        )
+        return cur.rowcount > 0
+
+
+def list_images(company_id: int, statuses: list[str] | None = None) -> list[dict]:
+    q = "SELECT * FROM images WHERE company_id=?"
+    args: list = [company_id]
+    if statuses:
+        q += " AND status IN (%s)" % ",".join("?" * len(statuses))
+        args += list(statuses)
+    q += " ORDER BY created_at DESC, id"
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(q, args).fetchall()]
+
+
+def get_image(company_id: int, image_id: str) -> dict | None:
+    with connect() as conn:
+        r = conn.execute(
+            "SELECT * FROM images WHERE company_id=? AND id=?", (company_id, image_id)
+        ).fetchone()
+        return dict(r) if r else None
+
+
+def update_image(image_id: str, **fields) -> None:
+    if not fields:
+        return
+    cols = ", ".join(f"{k}=?" for k in fields)
+    with _lock, connect() as conn:
+        conn.execute(f"UPDATE images SET {cols} WHERE id=?", (*fields.values(), image_id))
+
+
+def image_stats(company_id: int) -> dict:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS total,"
+            " SUM(CASE WHEN status='processed' THEN 1 ELSE 0 END) AS processed,"
+            " SUM(CASE WHEN status IN ('pending','failed','processing') THEN 1 ELSE 0 END) AS pending,"
+            " SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed"
+            " FROM images WHERE company_id=?",
+            (company_id,),
+        ).fetchone()
+    return {
+        "total": int(row["total"] or 0),
+        "processed": int(row["processed"] or 0),
+        "pending": int(row["pending"] or 0),
+        "failed": int(row["failed"] or 0),
+    }
+
+
+def mark_image_in_graph(company_id: int, image_id: str, triplet_count: int = 0) -> None:
+    with _lock, connect() as conn:
+        conn.execute(
+            "INSERT INTO image_graph(company_id, image_id, triplet_count, status, processed_at)"
+            " VALUES(?,?,?, 'processed', ?)"
+            " ON CONFLICT(company_id, image_id) DO UPDATE SET"
+            " triplet_count=excluded.triplet_count, status='processed',"
+            " processed_at=excluded.processed_at",
+            (company_id, image_id, triplet_count, now_iso()),
+        )
+
+
+def image_in_graph_ids(company_id: int) -> set[str]:
+    with connect() as conn:
+        return {
+            r["image_id"]
+            for r in conn.execute(
+                "SELECT image_id FROM image_graph WHERE company_id=? AND status='processed'",
+                (company_id,),
+            ).fetchall()
+        }
+
+
+def delete_image_triplets(company_id: int, image_ids: list[str]) -> int:
+    """删除指定图片此前入图产生的三元组（重新处理前调用）。"""
+    if not image_ids:
+        return 0
+    n = 0
+    with _lock, connect() as conn:
+        for iid in image_ids:
+            cur = conn.execute(
+                "DELETE FROM triplets WHERE company_id=? AND image_id=?", (company_id, iid)
+            )
+            n += cur.rowcount
+        conn.execute(
+            "DELETE FROM image_graph WHERE company_id=? AND image_id IN (%s)"
+            % ",".join("?" * len(image_ids)),
+            (company_id, *image_ids),
+        )
+    return n
