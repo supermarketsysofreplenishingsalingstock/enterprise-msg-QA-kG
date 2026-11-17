@@ -493,7 +493,7 @@ export async function ensureBrowser(headless: boolean) {
   return await getBrowser(Boolean(headless))
 }
 
-export async function fetchHtml(url: string, config: any, signal: AbortSignal, _session?: any) {
+export async function fetchHtml(url: string, config: any, signal: AbortSignal, session?: any) {
   const ua = String(config?.crawler?.userAgent ?? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36').trim()
   const origin = (() => {
     try {
@@ -512,6 +512,28 @@ export async function fetchHtml(url: string, config: any, signal: AbortSignal, _
     'accept-language': 'zh-CN,zh;q=0.9,en;q=0.7',
     referer
   }
+  // 质询 cookie 复用（跨通道）：优先用传入会话，其次读该 host 的持久化会话——
+  // 浏览器/人工验证通过后的 WAF cookie，能让 HTTP 直连也直接过盾（易探云这类按 TLS 指纹拦直连的站）
+  const cookieHeader = (() => {
+    let cookies: any[] | undefined = session?.cookies
+    if (!cookies?.length) {
+      try {
+        const host = safeHost(url)
+        const disk = host ? loadSessionForHost(host) : null
+        if (disk?.cookies?.length) cookies = disk.cookies
+      } catch {}
+    }
+    if (!cookies?.length) return ''
+    try {
+      return cookies
+        .filter((c) => c && typeof c.name === 'string' && typeof c.value === 'string')
+        .map((c) => `${c.name}=${c.value}`)
+        .join('; ')
+    } catch {
+      return ''
+    }
+  })()
+  if (cookieHeader) headers['cookie'] = cookieHeader
   const res = await fetchWithRetry(
     url,
     { headers, redirect: 'follow' },
@@ -696,19 +718,72 @@ export async function fetchViaMcp(url: string, config: any, signal: AbortSignal,
 /** @deprecated 请使用 fetchViaCloudScrape；保留别名兼容旧引用 */
 export const fetchViaCloudScrape = fetchViaMcp
 
-export function looksLikeCaptchaOrBlock(title: string, html: string) {
+type CaptchaBlockHit = { rule: string; snippet: string } | null
+
+/**
+ * 判断页面是否为拦截/质询页，并给出命中规则与上下文（用于诊断日志）。
+ *
+ * 误报防线（易探云/浪浪云这类「正常页被判 captcha」的教训）：
+ * - 整页级词匹配（裸 captcha、中文拦截文案、google 拦截文案）只在「内容贫瘠」的页面上生效——
+ *   真质询/拦截页正文极少（几百字以内），而正常首页正文上千字，即使页脚有验证码组件也不误杀；
+ * - WAF 强指纹（challenge-platform/cf_chl_/grecaptcha/turnstile…）无条件生效，它们只出现在拦截页；
+ * - 标题级规则无条件生效。
+ */
+function findCaptchaBlockHit(title: string, html: string): CaptchaBlockHit {
   const t = normalizeWhitespace(title).toLowerCase()
   const h = normalizeWhitespace(html).toLowerCase()
-  if (t.includes('just a moment') || t.includes('attention required')) return true
-  if (/验证码|安全验证|人机验证|访问受限|安全检查/.test(title)) return true
-  if (/(captcha|cloudflare|cf-ray|verify you are human|bot detection|access denied)/i.test(t)) return true
-  // 整页只匹配强特征（WAF 质询/拦截页必然出现的脚本与指纹），弱词（verify/challenge）
-  // 不能进整页匹配——正常站点的 JS 里有这些词会被误判成拦截页
-  if (/challenge-platform|cf_chl_|grecaptcha|recaptcha\/api|hcaptcha\.com|turnstile|captcha-delivery|arkose|px-captcha|distil_r_captcha|incapsula/i.test(h)) return true
-  if (/captcha/i.test(h)) return true
-  if (/请完成安全验证|检测到异常请求|您的访问过于频繁|抱歉，您访问的内容不存在/.test(html)) return true
-  if (/unusual traffic from your computer network|sorry we can't complete your request|before you continue to google/i.test(h)) return true
-  return false
+  const titleCtx = `title="${normalizeWhitespace(title).slice(0, 60)}"`
+  const ctx = (idx: number) => clipStr(h.slice(Math.max(0, idx - 50), idx + 110).replace(/\s+/g, ' '), 150)
+
+  // 内容贫瘠判定：去掉 script/style/标签后的可见正文长度。质询页通常 <200 字，正常首页上千字
+  let contentRich: boolean | null = null
+  const isContentRich = () => {
+    if (contentRich === null) {
+      const visible = h
+        .replace(/<script[\s\S]*?<\/script>/g, ' ')
+        .replace(/<style[\s\S]*?<\/style>/g, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, '')
+      contentRich = visible.length > 300
+    }
+    return contentRich
+  }
+
+  if (t.includes('just a moment') || t.includes('attention required')) return { rule: 'title:cloudflare_5s', snippet: titleCtx }
+  if (/验证码|安全验证|人机验证|访问受限|安全检查/.test(title)) return { rule: 'title:中文拦截词', snippet: titleCtx }
+  if (/(captcha|cloudflare|cf-ray|verify you are human|bot detection|access denied)/i.test(t)) return { rule: 'title:英文拦截词', snippet: titleCtx }
+
+  let m = /challenge-platform|cf_chl_|grecaptcha|recaptcha\/api|hcaptcha\.com|turnstile|captcha-delivery|arkose|px-captcha|distil_r_captcha|incapsula/i.exec(h)
+  if (m) return { rule: 'html:WAF强特征', snippet: ctx(m.index) }
+
+  // 词级规则：仅对内容贫瘠页面生效（配合下方诊断日志实锤误杀源）
+  if (!isContentRich()) {
+    m = /captcha/i.exec(h)
+    if (m) return { rule: 'html:captcha(内容贫瘠页)', snippet: ctx(m.index) }
+    m = /请完成安全验证|检测到异常请求|您的访问过于频繁|抱歉，您访问的内容不存在/.exec(h)
+    if (m) return { rule: 'html:中文拦截文案', snippet: ctx(m.index) }
+    m = /unusual traffic from your computer network|sorry we can't complete your request|before you continue to google/i.exec(h)
+    if (m) return { rule: 'html:google拦截文案', snippet: ctx(m.index) }
+  }
+  return null
+}
+
+export function looksLikeCaptchaOrBlock(title: string, html: string) {
+  return findCaptchaBlockHit(title, html) !== null
+}
+
+/** 拦截判定诊断日志：命中规则 + 上下文，直接定位误杀源 */
+function logCaptchaDiagnosis(
+  emitLog: ((level: 'info' | 'warn' | 'error', message: string) => void) | null,
+  url: string,
+  title: string,
+  html: string,
+  stage: string
+) {
+  if (!emitLog) return
+  const hit = findCaptchaBlockHit(title, html)
+  if (!hit) return
+  emitLog('warn', `Worker：拦截判定命中 [${hit.rule}]（${stage}）${url}；htmlLen=${html.length}；${hit.snippet}`)
 }
 
 /**
@@ -791,6 +866,7 @@ async function fetchViaHeadfulFallback(
     if (!looksLikeCaptchaOrBlock(title, html)) {
       return finalizeHeadfulSnapshot(page, context, url, title, html)
     }
+    logCaptchaDiagnosis(emitLog, url, title, html, '有头兜底/初始')
 
     // 机器阶段：先给 JS 质询自动通过的时间
     const autoWaitMs = waitForHuman ? 25_000 : 18_000
@@ -802,11 +878,17 @@ async function fetchViaHeadfulFallback(
       if (emitLog) emitLog('info', 'Worker：质询已自动通过（有头模式）')
       return finalizeHeadfulSnapshot(page, context, url, title, html)
     }
+    // 质询即使被误判（或部分通过），已拿到的 cookie 也要落盘：
+    // 下一次抓取（无头/HTTP 直连）带上它往往能直接过 WAF
+    await saveHeadfulCookiesQuietly(context, url)
 
     if (!waitForHuman) return null
 
     // 人工阶段：等待用户在窗口内完成验证（最后手段）
-    if (emitLog) emitLog('warn', `Worker：请在弹出的浏览器窗口中完成人机验证（最长 180 秒，完成后自动继续）：${url}`)
+    if (emitLog) {
+      emitLog('warn', `Worker：请在弹出的浏览器窗口中完成人机验证（最长 180 秒，完成后自动继续）：${url}`)
+      emitLog('info', `Worker：若窗口内没有出现验证组件，说明质询可能已通过但被误判——不用操作，关闭窗口即可放弃本次，cookie 已保存`)
+    }
     const humanDeadline = Date.now() + 180_000
     while (Date.now() < humanDeadline) {
       if (signal.aborted) return null
@@ -815,12 +897,16 @@ async function fetchViaHeadfulFallback(
         title = await page.title().catch(() => '')
         html = await page.content()
       } catch {
+        // 页面/窗口被用户关闭：明确记录，不再静默失败
+        if (emitLog) emitLog('warn', 'Worker：验证窗口已被关闭（或页面不可用），放弃本次人工验证；已保存的 cookie 仍会在后续抓取中复用')
         return null
       }
       if (!looksLikeCaptchaOrBlock(title, html)) break
     }
     if (looksLikeCaptchaOrBlock(title, html)) {
+      logCaptchaDiagnosis(emitLog, url, title, html, '有头兜底/人工等待超时')
       if (emitLog) emitLog('error', `Worker：人工验证超时或未通过：${url}`)
+      await saveHeadfulCookiesQuietly(context, url)
       return null
     }
     if (emitLog) emitLog('info', 'Worker：人工验证通过，cookie 已保存供同站后续页面复用')
@@ -832,6 +918,15 @@ async function fetchViaHeadfulFallback(
       if (browser) await browser.close()
     } catch {}
   }
+}
+
+/** 只保存 cookie，不采集页面（用于兜底失败但仍想复用会话的场景） */
+async function saveHeadfulCookiesQuietly(context: any, url: string) {
+  try {
+    const cookies = await context.cookies()
+    const host = safeHost(url)
+    if (host && cookies.length) saveSessionForHost(host, cookies as any)
+  } catch {}
 }
 
 async function finalizeHeadfulSnapshot(
@@ -1076,6 +1171,7 @@ export async function workerExecute(
 
       if (looksLikeCaptchaOrBlock(title, html)) {
         // 先给 WAF 的 JS 质询自动通过的机会，别立即判死
+        logCaptchaDiagnosis(emitLog, url, title, html, '浏览器/初始')
         emitLog('warn', `Worker：疑似拦截/质询页，等待其自动通过（最长 15s）：${url}`)
         const autoPassed = await waitChallengeAutoPass(page, signal, 15_000)
         title = await page.title().catch(() => '')
