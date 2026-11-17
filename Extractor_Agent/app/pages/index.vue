@@ -5,6 +5,7 @@
       <header class="main-header">
         <div class="header-row">
           <h1 class="title">数据提取助手</h1>
+          <NuxtLink to="/history" class="capability-badge">历史爬取</NuxtLink>
           <button
             type="button"
             class="capability-badge"
@@ -2325,4 +2326,5 @@ body {
     max-width: 100%;
   }
 }
+
 </style>

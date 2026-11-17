@@ -10,6 +10,7 @@ import { enrichItemsFromSerpContext } from '../utils/serp_excerpt_enrich'
 import { bumpRunCost, ensureRunCost, runCostToMeta } from '../utils/runCost'
 import { getExtractorAgentEnv } from '../utils/extractor_agent_env'
 import { loadSessionForHost } from '../utils/crawl_session_store'
+import { archiveRunResult } from '../utils/run_archive'
 import { getCapabilityProfile } from '../services/capabilityRegistry'
 import { seedUrlMatchesTargetSite } from './plan/structural'
 import { extractHttpUrl } from '../utils/url_extract'
@@ -1198,6 +1199,12 @@ export async function runCrawlerWorkflow(params: {
     params.emitLog('info', `Crawler：结果已保存为 JSON：${outputPath}`)
   } catch (e: any) {
     params.emitLog('warn', `Crawler：保存 JSON 失败：${e?.message || e}`)
+  }
+
+  // 归档到 .data/runs/ 供前端「历史爬取」面板回看（失败不影响主流程）
+  const archived = await archiveRunResult(result)
+  if (archived) {
+    params.emitLog('info', `Crawler：本次运行已归档（${archived.id}），可在「历史爬取」面板查看`)
   }
 
   return { ...result, outputPath }
