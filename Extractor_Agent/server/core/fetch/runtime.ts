@@ -439,8 +439,43 @@ export async function fetchRobotsPolicy(url: string, config: any, signal: AbortS
 
 let globalBrowser: Browser | null = null
 let globalBrowserHeadless: boolean | null = null
+let globalBrowserResolverRules = ''
 // 已触发过「有头/人工验证」兜底的 host：同站只弹一次，后续靠持久化 cookie 复用
 const headfulCaptchaTriedHosts = new Set<string>()
+// OS DNS 解析失败时用 DoH 解出的 host→IP 映射，注入 chromium --host-resolver-rules
+const dnsOverrides = new Map<string, string>()
+
+function resolverRulesArg(): string {
+  if (!dnsOverrides.size) return ''
+  return [...dnsOverrides.entries()].map(([h, ip]) => `MAP ${h} ${ip}`).join(',')
+}
+
+/**
+ * OS DNS 解不出域名时的兜底：走 DoH 公共 DNS（阿里 223.5.5.5 / 腾讯 doh.pub）解析 A 记录。
+ * 解出的 IP 通过 chromium --host-resolver-rules=MAP 注入浏览器通道。
+ */
+async function resolveHostViaDoh(host: string, signal: AbortSignal): Promise<string | null> {
+  const endpoints = [
+    `https://223.5.5.5/resolve?name=${encodeURIComponent(host)}&type=A`,
+    `https://doh.pub/dns-query?name=${encodeURIComponent(host)}&type=A`
+  ]
+  for (const ep of endpoints) {
+    try {
+      const res = await fetchWithRetry(
+        ep,
+        { headers: { accept: 'application/dns-json' }, redirect: 'follow' },
+        signal,
+        { timeoutMs: 6000, maxAttempts: 1, baseBackoffMs: 200 }
+      )
+      if (!res || !(res as any).ok) continue
+      const data = JSON.parse(await (res as any).text())
+      const answer = Array.isArray(data?.Answer) ? data.Answer : []
+      const a = answer.find((x: any) => Number(x?.type) === 1 && /^\d+\.\d+\.\d+\.\d+$/.test(String(x?.data)))
+      if (a) return String(a.data)
+    } catch {}
+  }
+  return null
+}
 
 function isBrowserRuntimeUnavailable(msg: string): boolean {
   const m = String(msg || '').toLowerCase()
@@ -458,32 +493,38 @@ function resolveChromiumExecutablePath(): string | undefined {
 }
 
 async function getBrowser(headless: boolean) {
+  const rules = resolverRulesArg()
   if (!globalBrowser) {
     globalBrowserHeadless = headless
+    globalBrowserResolverRules = rules
     const executablePath = resolveChromiumExecutablePath()
+    const args = [
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--no-default-browser-check',
+      '--disable-features=IsolateOrigins,site-per-process'
+    ]
+    if (rules) args.push(`--host-resolver-rules=${rules}`)
     try {
       globalBrowser = await chromium.launch({
         ...(executablePath ? { executablePath } : {}),
         headless,
         ignoreDefaultArgs: ['--enable-automation'],
-        args: [
-          '--disable-blink-features=AutomationControlled',
-          '--disable-dev-shm-usage',
-          '--no-default-browser-check',
-          '--disable-features=IsolateOrigins,site-per-process'
-        ]
+        args
       })
     } catch (e: any) {
       globalBrowser = null
       globalBrowserHeadless = null
+      globalBrowserResolverRules = ''
       throw e
     }
-  } else if (globalBrowserHeadless !== headless) {
+  } else if (globalBrowserHeadless !== headless || globalBrowserResolverRules !== rules) {
     try {
       await globalBrowser.close()
     } catch {}
     globalBrowser = null
     globalBrowserHeadless = null
+    globalBrowserResolverRules = ''
     return await getBrowser(headless)
   }
   return globalBrowser
@@ -832,15 +873,18 @@ async function fetchViaHeadfulFallback(
   let browser: Browser | null = null
   try {
     const executablePath = resolveChromiumExecutablePath()
+    const headfulArgs = [
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--no-default-browser-check'
+    ]
+    const rules = resolverRulesArg()
+    if (rules) headfulArgs.push(`--host-resolver-rules=${rules}`)
     browser = await chromium.launch({
       ...(executablePath ? { executablePath } : {}),
       headless: !waitForHuman,
       ignoreDefaultArgs: ['--enable-automation'],
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--disable-dev-shm-usage',
-        '--no-default-browser-check'
-      ]
+      args: headfulArgs
     })
     const ua = pickUserAgent(config)
     const context = await browser.newContext({
@@ -1028,7 +1072,11 @@ export async function workerExecute(
       emitLog('warn', `Worker：快速路径云抓取失败，本次 URL 不再重复云抓取`)
     } catch (e: any) {
       const msg = typeof e?.message === 'string' ? e.message : String(e)
-      const shouldFallback = isHttpBlockedError(msg)
+      // 网络层失败（DNS 解析失败/连接失败）也下放浏览器通道：
+      // 浏览器路径带 DoH 兜底解析（ERR_NAME_NOT_RESOLVED 时），直连没有这条路
+      const shouldFallback =
+        isHttpBlockedError(msg) ||
+        /ERR_NAME_NOT_RESOLVED|ENOTFOUND|EAI_AGAIN|fetch failed|ERR_CONNECTION_(REFUSED|TIMED_OUT|RESET)/i.test(msg)
 
       if (!mcpFailedPermanently && config?.mcp?.provider) {
         const fb = await tryCloudScrapeFallback(url, config, signal, emitLog, runStats, options, Date.now(), mcpFailedPermanently)
@@ -1049,7 +1097,9 @@ export async function workerExecute(
   }
 
   let lastErr: any = null
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  // DoH 兜底解析成功后允许追加一次重试（浏览器需重启并带上 host-resolver-rules）
+  let extraAttempts = 0
+  for (let attempt = 1; attempt <= maxAttempts + extraAttempts; attempt++) {
     if (attempt === 2 && !mcpFailedPermanently) {
       const fb = await tryCloudScrapeFallback(url, config, signal, emitLog, runStats, options, Date.now(), mcpFailedPermanently)
       if (fb) {
@@ -1202,7 +1252,29 @@ export async function workerExecute(
 
       if (proxy) proxyPool?.markBad(proxy)
 
-      if (!retryable || attempt >= maxAttempts) {
+      // DNS 解析失败（系统/ISP DNS 故障、污染、负缓存）：改用 DoH 公共 DNS 解析，
+      // 解出的 IP 通过 chromium --host-resolver-rules 注入，下一轮浏览器重试即生效
+      if (/ERR_NAME_NOT_RESOLVED|ENOTFOUND|EAI_AGAIN/i.test(msg) && !signal.aborted) {
+        const dnsHost = safeHost(url)
+        if (dnsHost && !dnsOverrides.has(dnsHost)) {
+          emitLog('warn', `Worker：系统 DNS 解析失败，改用 DoH 公共 DNS（阿里/腾讯）解析 ${dnsHost}…`)
+          const ip = await resolveHostViaDoh(dnsHost, signal)
+          const apex = dnsHost.replace(/^www\./, '')
+          const apexIp = apex && apex !== dnsHost ? await resolveHostViaDoh(apex, signal) : null
+          if (ip) {
+            dnsOverrides.set(dnsHost, ip)
+            emitLog('info', `Worker：DoH 解析成功 ${dnsHost} → ${ip}，重启浏览器并映射后重试`)
+          }
+          if (apexIp) dnsOverrides.set(apex, apexIp)
+          if (!ip && !apexIp) {
+            emitLog('error', `Worker：DoH 也解析不出 ${dnsHost}——域名/网络可能不可达，请检查本机 DNS 设置`)
+          } else if (attempt >= maxAttempts + extraAttempts && extraAttempts < 2) {
+            extraAttempts++
+          }
+        }
+      }
+
+      if (!retryable || attempt >= maxAttempts + extraAttempts) {
         if (msg.includes('closed') || msg.includes('Navigation interrupted')) {
           throw new Error('Task canceled by user')
         }

@@ -1,0 +1,1 @@
+- [2026-11-17 14:53:49] ingest 快照 snap_20261117_145347_69e6：来源 页面15/文件0，chunk 111，图片 新登记9（未抽取，待处理 chunk 111）；LLM={"provider": "local_deepseek", "model": "deepseek-r1:14b", "base_url": "http://localhost:11434/v1"}
