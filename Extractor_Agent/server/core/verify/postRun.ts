@@ -102,7 +102,9 @@ export async function runVerifierRetries(input: {
   if (!evalResult.quality.passed && !browserAlreadyTried && !Boolean(mergedOptions.__qualityBrowserRetryDone)) {
     retryMeta.triggered = true
     retryMeta.reasonCodes = [...evalResult.retryReasons]
-    const retryHeadless = mergedOptions.headless ?? true
+    // 与 workerExecute 的无头开关保持一致：EXTRACTOR_HEADLESS=0/false → 有头
+    const envHeadless = String(process.env.EXTRACTOR_HEADLESS ?? '').trim().toLowerCase()
+    const retryHeadless = mergedOptions.headless ?? !(envHeadless === '0' || envHeadless === 'false')
     let browserReady = true
     try {
       await ensureBrowser(Boolean(retryHeadless))

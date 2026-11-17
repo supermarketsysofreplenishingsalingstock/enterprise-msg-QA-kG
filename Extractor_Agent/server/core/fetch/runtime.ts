@@ -113,11 +113,64 @@ async function simulateHumanBehavior(page: any, signal: AbortSignal) {
 }
 
 function stealthInitScript() {
+  // 每段独立 try/catch：某一段失败不影响其余补丁生效
   const script = `
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    window.chrome = { runtime: {} };
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+    try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+    try {
+      window.chrome = {
+        app: {
+          isInstalled: false,
+          InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+          RunningState: { RUNNING: 'running', CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run' }
+        },
+        runtime: {
+          Platform: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
+          connect: function () {},
+          sendMessage: function () {},
+          id: undefined
+        },
+        csi: function () { return {} },
+        loadTimes: function () { return {} }
+      };
+    } catch (e) {}
+    try {
+      const pluginArr = [
+        { name: 'PDF Viewer' },
+        { name: 'Chrome PDF Viewer' },
+        { name: 'Chromium PDF Viewer' },
+        { name: 'Microsoft Edge PDF Viewer' },
+        { name: 'WebKit built-in PDF' }
+      ];
+      pluginArr.item = function (i) { return this[i] };
+      pluginArr.namedItem = function (n) { return this.find(function (p) { return p.name === n }) || null };
+      pluginArr.refresh = function () {};
+      Object.defineProperty(navigator, 'plugins', { get: function () { return pluginArr } });
+    } catch (e) {}
+    try { Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] }); } catch (e) {}
+    try { Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 }); } catch (e) {}
+    try { Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 }); } catch (e) {}
+    try {
+      if (window.navigator.permissions && window.navigator.permissions.query) {
+        const origQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
+        window.navigator.permissions.query = function (p) {
+          if (p && p.name === 'notifications') {
+            return Promise.resolve({ state: (window.Notification && window.Notification.permission) || 'default', onchange: null });
+          }
+          return origQuery(p);
+        };
+      }
+    } catch (e) {}
+    try {
+      const glProto = window.WebGLRenderingContext && window.WebGLRenderingContext.prototype;
+      if (glProto && glProto.getParameter) {
+        const origGetParameter = glProto.getParameter;
+        glProto.getParameter = function (p) {
+          if (p === 37445) return 'Intel Inc.';               // UNMASKED_VENDOR_WEBGL
+          if (p === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+          return origGetParameter.call(this, p);
+        };
+      }
+    } catch (e) {}
   `
   return script
 }
@@ -386,6 +439,8 @@ export async function fetchRobotsPolicy(url: string, config: any, signal: AbortS
 
 let globalBrowser: Browser | null = null
 let globalBrowserHeadless: boolean | null = null
+// 已触发过「有头/人工验证」兜底的 host：同站只弹一次，后续靠持久化 cookie 复用
+const headfulCaptchaTriedHosts = new Set<string>()
 
 function isBrowserRuntimeUnavailable(msg: string): boolean {
   const m = String(msg || '').toLowerCase()
@@ -647,9 +702,32 @@ export function looksLikeCaptchaOrBlock(title: string, html: string) {
   if (t.includes('just a moment') || t.includes('attention required')) return true
   if (/验证码|安全验证|人机验证|访问受限|安全检查/.test(title)) return true
   if (/(captcha|cloudflare|cf-ray|verify you are human|bot detection|access denied)/i.test(t)) return true
-  if (/(captcha|verify|challenge|recaptcha|hcaptcha)/i.test(h)) return true
+  // 整页只匹配强特征（WAF 质询/拦截页必然出现的脚本与指纹），弱词（verify/challenge）
+  // 不能进整页匹配——正常站点的 JS 里有这些词会被误判成拦截页
+  if (/challenge-platform|cf_chl_|grecaptcha|recaptcha\/api|hcaptcha\.com|turnstile|captcha-delivery|arkose|px-captcha|distil_r_captcha|incapsula/i.test(h)) return true
+  if (/captcha/i.test(h)) return true
   if (/请完成安全验证|检测到异常请求|您的访问过于频繁|抱歉，您访问的内容不存在/.test(html)) return true
   if (/unusual traffic from your computer network|sorry we can't complete your request|before you continue to google/i.test(h)) return true
+  return false
+}
+
+/**
+ * WAF 的 JS 质询（如 Cloudflare 5 秒盾、高防 CDN 人机校验）通常无需人工交互、
+ * 几秒内自动通过：轮询等待页面标题/内容变化后复查，避免质询还没跑完就被判死。
+ */
+async function waitChallengeAutoPass(page: any, signal: AbortSignal, maxWaitMs: number): Promise<boolean> {
+  const deadline = Date.now() + Math.max(3000, maxWaitMs)
+  while (Date.now() < deadline) {
+    if (signal.aborted) return false
+    await sleep(1500, signal)
+    try {
+      const t = await page.title().catch(() => '')
+      const h = await page.content()
+      if (!looksLikeCaptchaOrBlock(t, h)) return true
+    } catch {
+      return false
+    }
+  }
   return false
 }
 
@@ -660,6 +738,125 @@ export function extractTitleFromHtml(html: string) {
   } catch {
     return ''
   }
+}
+
+/**
+ * 有头浏览器兜底通道（独立 chromium 实例，不影响全局共享浏览器）：
+ * 机器优先 —— 有头模式下多数 WAF 的 JS 质询会直接放行；
+ * 若仍受阻且 waitForHuman=true，则保持窗口打开，等待用户在窗口内完成人机验证（能机器做就不人工）。
+ * 验证通过后 cookie 按 host 持久化，同站后续页面（无头）自动复用。
+ */
+async function fetchViaHeadfulFallback(
+  url: string,
+  config: any,
+  signal: AbortSignal,
+  emitLog: (level: 'info' | 'warn' | 'error', message: string) => void,
+  session: any,
+  waitForHuman: boolean
+): Promise<FetchSnapshot | null> {
+  let browser: Browser | null = null
+  try {
+    const executablePath = resolveChromiumExecutablePath()
+    browser = await chromium.launch({
+      ...(executablePath ? { executablePath } : {}),
+      headless: !waitForHuman,
+      ignoreDefaultArgs: ['--enable-automation'],
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage',
+        '--no-default-browser-check'
+      ]
+    })
+    const ua = pickUserAgent(config)
+    const context = await browser.newContext({
+      userAgent: ua,
+      viewport: { width: 1366, height: 768 },
+      locale: 'zh-CN',
+      timezoneId: 'Asia/Shanghai',
+      ignoreHTTPSErrors: true,
+      extraHTTPHeaders: { 'accept-language': 'zh-CN,zh;q=0.9,en;q=0.7' }
+    })
+    if (session?.cookies) {
+      try {
+        await context.addCookies(session.cookies)
+      } catch {}
+    }
+    await context.addInitScript(stealthInitScript())
+    const page = await context.newPage()
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
+    await simulateHumanBehavior(page, signal).catch(() => {})
+
+    let title = await page.title().catch(() => '')
+    let html = await page.content()
+    if (!looksLikeCaptchaOrBlock(title, html)) {
+      return finalizeHeadfulSnapshot(page, context, url, title, html)
+    }
+
+    // 机器阶段：先给 JS 质询自动通过的时间
+    const autoWaitMs = waitForHuman ? 25_000 : 18_000
+    if (emitLog) emitLog('warn', `Worker：有头浏览器遇到质询页，等待其自动通过（最长 ${Math.round(autoWaitMs / 1000)}s）…`)
+    const autoPassed = await waitChallengeAutoPass(page, signal, autoWaitMs)
+    title = await page.title().catch(() => '')
+    html = await page.content()
+    if (autoPassed && !looksLikeCaptchaOrBlock(title, html)) {
+      if (emitLog) emitLog('info', 'Worker：质询已自动通过（有头模式）')
+      return finalizeHeadfulSnapshot(page, context, url, title, html)
+    }
+
+    if (!waitForHuman) return null
+
+    // 人工阶段：等待用户在窗口内完成验证（最后手段）
+    if (emitLog) emitLog('warn', `Worker：请在弹出的浏览器窗口中完成人机验证（最长 180 秒，完成后自动继续）：${url}`)
+    const humanDeadline = Date.now() + 180_000
+    while (Date.now() < humanDeadline) {
+      if (signal.aborted) return null
+      await sleep(2000, signal)
+      try {
+        title = await page.title().catch(() => '')
+        html = await page.content()
+      } catch {
+        return null
+      }
+      if (!looksLikeCaptchaOrBlock(title, html)) break
+    }
+    if (looksLikeCaptchaOrBlock(title, html)) {
+      if (emitLog) emitLog('error', `Worker：人工验证超时或未通过：${url}`)
+      return null
+    }
+    if (emitLog) emitLog('info', 'Worker：人工验证通过，cookie 已保存供同站后续页面复用')
+    return finalizeHeadfulSnapshot(page, context, url, title, html)
+  } catch {
+    return null
+  } finally {
+    try {
+      if (browser) await browser.close()
+    } catch {}
+  }
+}
+
+async function finalizeHeadfulSnapshot(
+  page: any,
+  context: any,
+  url: string,
+  title: string,
+  html: string
+): Promise<FetchSnapshot> {
+  let finalUrl = url
+  try {
+    finalUrl = page.url()
+  } catch {}
+  try {
+    const cookies = await context.cookies()
+    const host = safeHost(finalUrl || url)
+    if (host && cookies.length) saveSessionForHost(host, cookies as any)
+  } catch {}
+  try {
+    await context.close()
+  } catch {}
+  try {
+    await page.close()
+  } catch {}
+  return { url, finalUrl, title: normalizeWhitespace(title), html, networkJson: [] }
 }
 
 export async function workerExecute(
@@ -675,12 +872,23 @@ export async function workerExecute(
 ): Promise<FetchSnapshot> {
   url = rewriteSearchSerpSeedToCnBing(String(url ?? '').trim())
   const maxAttempts = 3
-  const headless = options.headless ?? true
+  // 无头开关：options.headless 优先，其次环境变量 EXTRACTOR_HEADLESS（0/false → 有头模式）
+  const envHeadless = String(process.env.EXTRACTOR_HEADLESS ?? '').trim().toLowerCase()
+  const headless = options.headless ?? !(envHeadless === '0' || envHeadless === 'false')
   const delayMinMs = Number.isFinite(Number(options.delayMinMs)) ? Math.max(0, Math.floor(Number(options.delayMinMs))) : 1000
   const delayMaxMs = Number.isFinite(Number(options.delayMaxMs)) ? Math.max(0, Math.floor(Number(options.delayMaxMs))) : 5000
   const attemptDelay = () => sleep(randInt(delayMinMs, delayMaxMs), signal)
   const shortErr = (msg: string) => normalizeWhitespace(msg).slice(0, 160)
   let mcpFailedPermanently = false
+  // 每次执行前重读该 host 的持久化 cookie 会话：有头模式/人工验证保存的登录态
+  // 能立刻被同 run 后续页面与后续任务复用（state.session 只是 run 启动时载入的快照）
+  let effectiveSession = session
+  try {
+    const diskSession = safeHost(url) ? loadSessionForHost(safeHost(url)) : null
+    if (diskSession?.cookies?.length) {
+      effectiveSession = diskSession
+    }
+  } catch {}
   if (!(options as any).__runStats) (options as any).__runStats = { _events: [] }
   const runStats: any = (options as any).__runStats
 
@@ -800,8 +1008,8 @@ export async function workerExecute(
 
     await context.addInitScript(stealthInitScript())
 
-    if (session?.cookies) {
-      await context.addCookies(session.cookies)
+    if (effectiveSession?.cookies) {
+      await context.addCookies(effectiveSession.cookies)
     }
 
     const page = await context.newPage()
@@ -862,12 +1070,21 @@ export async function workerExecute(
       // 某些站点在页面稳定后再做随机移动/滚动，能模拟用户；如果这一步导致异常，直接忽略，不影响抓取结果。
       await simulateHumanBehavior(page, signal).catch(() => {})
 
-      const title = await page.title().catch(() => '')
-      const html = await page.content()
-      const finalUrl = page.url()
+      let title = await page.title().catch(() => '')
+      let html = await page.content()
+      let finalUrl = page.url()
 
       if (looksLikeCaptchaOrBlock(title, html)) {
-        throw new Error('captcha_or_block_page')
+        // 先给 WAF 的 JS 质询自动通过的机会，别立即判死
+        emitLog('warn', `Worker：疑似拦截/质询页，等待其自动通过（最长 15s）：${url}`)
+        const autoPassed = await waitChallengeAutoPass(page, signal, 15_000)
+        title = await page.title().catch(() => '')
+        html = await page.content()
+        finalUrl = page.url()
+        if (!autoPassed && looksLikeCaptchaOrBlock(title, html)) {
+          throw new Error('captcha_or_block_page')
+        }
+        emitLog('info', `Worker：质询已自动通过，继续抓取 ${url}`)
       }
 
       try {
@@ -900,6 +1117,26 @@ export async function workerExecute(
             return mcpSnap
           }
           mcpFailedPermanently = true
+        }
+        // 有头/人工兜底（机器优先）：每个 host 只触发一次，之后靠保存的 cookie 复用
+        const hostKey = safeHost(url)
+        if (/captcha_or_block/i.test(msg) && hostKey && !headfulCaptchaTriedHosts.has(hostKey) && !signal.aborted) {
+          headfulCaptchaTriedHosts.add(hostKey)
+          emitLog('warn', `Worker：无头浏览器仍受阻，改用有头浏览器重试（机器优先）：${url}`)
+          const headful = await fetchViaHeadfulFallback(url, config, signal, emitLog, effectiveSession, false)
+          if (headful) {
+            pushRunEvent(runStats, { ts: nowTs(), host: safeHost(url), url, channel: 'browser', status: 'ok', ms: Date.now() - tStart }, options)
+            emitLog('info', `Worker：有头浏览器重试成功 ${url}`)
+            return headful
+          }
+          if ((options as any).__allowManualCaptcha !== false && !signal.aborted) {
+            emitLog('warn', `Worker：有头重试未通过，弹出浏览器窗口等待人工验证（最后手段）：${url}`)
+            const manual = await fetchViaHeadfulFallback(url, config, signal, emitLog, effectiveSession, true)
+            if (manual) {
+              pushRunEvent(runStats, { ts: nowTs(), host: safeHost(url), url, channel: 'browser', status: 'ok', ms: Date.now() - tStart }, options)
+              return manual
+            }
+          }
         }
         emitLog('error', `Worker：页面抓取失败：${url}；原因=${shortErr(msg)}`)
         throw e
