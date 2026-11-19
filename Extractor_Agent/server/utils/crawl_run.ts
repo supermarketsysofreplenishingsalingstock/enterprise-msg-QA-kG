@@ -24,6 +24,7 @@ import { learnFromSuccessfulCrawl } from './user_preferences'
 import { indexCrawlExperienceVector } from './experience_vectors'
 import { ensureRunCost, runCostToMeta } from './runCost'
 import { buildExtractorMemoryFacts } from './manager_memory_bridge'
+import { checkpointKeyFromSeeds, clearCrawlCheckpoint } from './crawl_checkpoint'
 
 export type ExecuteExtractParams = {
   task: string
@@ -335,8 +336,25 @@ export async function executeExtractRun(params: ExecuteExtractParams) {
             ...withMeta.meta,
             kb_ingest: { ok: false, error: String(kbRes?.detail ?? kbResp.statusText).slice(0, 240) },
           }
+          emit?.({
+            type: 'log',
+            payload: {
+              level: 'warn',
+              message: `知识库：ingest 失败（${String(kbRes?.detail ?? kbResp.statusText).slice(0, 160)}）。已爬内容已断点保存，下次爬取同站点会自动续传并重新推送知识库。`,
+              ts: Date.now(),
+            },
+          })
         }
         setRunMeta(withMeta.meta)
+        // 断点续爬：推送成功（含「存为待处理」模式）→ 内容已安全入库，清除断点，下次爬取从零开始
+        if ((withMeta.meta as any)?.kb_ingest?.ok) {
+          try {
+            const ckKey = checkpointKeyFromSeeds(
+              Array.isArray((withMeta as any)?.plan?.seedUrls) ? (withMeta as any).plan.seedUrls : [],
+            )
+            if (ckKey) clearCrawlCheckpoint(ckKey)
+          } catch {}
+        }
       } catch (e: any) {
         withMeta.meta = {
           ...withMeta.meta,
@@ -347,7 +365,7 @@ export async function executeExtractRun(params: ExecuteExtractParams) {
           type: 'log',
           payload: {
             level: 'warn',
-            message: `知识库：ingest 失败（${String(e?.message ?? e).slice(0, 160)}）。请确认 wiki_kb_service 已启动。`,
+            message: `知识库：ingest 失败（${String(e?.message ?? e).slice(0, 160)}）。已爬内容已断点保存，下次爬取同站点会自动续传并重新推送知识库。`,
             ts: Date.now(),
           },
         })

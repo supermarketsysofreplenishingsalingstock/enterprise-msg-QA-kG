@@ -11,6 +11,12 @@ import { bumpRunCost, ensureRunCost, runCostToMeta } from '../utils/runCost'
 import { getExtractorAgentEnv } from '../utils/extractor_agent_env'
 import { loadSessionForHost } from '../utils/crawl_session_store'
 import { archiveRunResult } from '../utils/run_archive'
+import {
+  checkpointKeyFromSeeds,
+  clearCrawlCheckpoint,
+  loadCrawlCheckpoint,
+  saveCrawlCheckpoint,
+} from '../utils/crawl_checkpoint'
 import { getCapabilityProfile } from '../services/capabilityRegistry'
 import { seedUrlMatchesTargetSite } from './plan/structural'
 import { extractHttpUrl } from '../utils/url_extract'
@@ -209,6 +215,18 @@ function normalizeWhitespace(text: string) {
     .trim()
 }
 
+/** 断点续爬用 URL 归一化：host 小写、去 hash、去尾部斜杠（根路径保留 /），用于「已爬过」判定 */
+function normUrlForCk(u: string) {
+  try {
+    const x = new URL(String(u))
+    x.hash = ''
+    const p = x.pathname.replace(/\/+$/, '') || '/'
+    return `${x.hostname.toLowerCase()}${p}${x.search}`
+  } catch {
+    return ''
+  }
+}
+
 export async function runCrawlerWorkflow(params: {
   task: string
   options: any
@@ -404,13 +422,79 @@ export async function runCrawlerWorkflow(params: {
     const planParsed = PlanSchema.safeParse(state.plan)
     if (!planParsed.success) throw new Error('invalid plan')
     const plan = planParsed.data as Plan
+
+    // ── 断点续爬：加载同站点上次中断/被封/重启遗留的已爬内容（每轮 orchestrator 只加载一次）──
+    const ckKey = checkpointKeyFromSeeds(plan.seedUrls)
+    ;(state.options as any).__ckKey = ckKey
+    let ckExtraPages = 0
+    if (ckKey && !((state.options as any).__ckLoaded)) {
+      ;(state.options as any).__ckLoaded = true
+      ;((state.options as any).__ckUrls ??= new Set<string>())
+      if ((state.options as any)?.freshCrawl === true) {
+        // 显式要求从头爬：清除断点，不恢复历史内容
+        clearCrawlCheckpoint(ckKey)
+        params.emitLog('info', '断点续爬：freshCrawl=true，忽略并清除上次断点，从头爬取')
+      } else {
+        const ck = loadCrawlCheckpoint(ckKey)
+        if (ck) {
+          // 恢复页面正文（正文去重集合同步恢复，避免跳转变体重复入 KB）
+          const kbPages: any[] = ((state.options as any).__kbPages ??= [])
+          const kbTextSeen: Set<string> = ((state.options as any).__kbTextSeen ??= new Set())
+          for (const p of Array.isArray(ck.kbPages) ? ck.kbPages : []) {
+            const textKey = normalizeWhitespace(String(p?.text ?? '')).slice(0, 1200)
+            if (p?.url && textKey && !kbTextSeen.has(textKey)) {
+              kbTextSeen.add(textKey)
+              kbPages.push({ url: String(p.url), title: String(p.title ?? p.url), text: String(p.text ?? '') })
+            }
+          }
+          // 恢复图片 / 附件（loadCrawlCheckpoint 已过滤磁盘上不存在的文件）
+          const imgSeen: Set<string> = ((state.options as any).__imageSeenUrls ??= new Set())
+          const imgBudget: any[] = ((state.options as any).__kbImages ??= [])
+          for (const im of Array.isArray(ck.images) ? ck.images : []) {
+            if (im?.url) imgSeen.add(String(im.url))
+            imgBudget.push(im)
+          }
+          const attSeen: Set<string> = ((state.options as any).__attachmentSeenUrls ??= new Set())
+          const attBudget: any[] = ((state.options as any).__attachments ??= [])
+          for (const f of Array.isArray(ck.attachments) ? ck.attachments : []) {
+            if (f?.url) attSeen.add(String(f.url))
+            attBudget.push(f)
+          }
+          // 恢复图片/附件配额：旧内容不挤占本轮新下载额度
+          if (imgBudget.length > 0) {
+            ;(state.options as any).imageMax =
+              (Number((state.options as any).imageMax ?? 60) || 60) + imgBudget.length
+          }
+          if (attBudget.length > 0) {
+            ;(state.options as any).attachmentMax =
+              (Number((state.options as any).attachmentMax ?? 20) || 20) + attBudget.length
+          }
+          // 已爬 URL / 待爬队列 / 深度（队列在 visitedSet 初始化后合并，见下方）
+          for (const u of Array.isArray(ck.crawledUrls) ? ck.crawledUrls : []) {
+            if (u) (state.options as any).__ckUrls.add(String(u))
+          }
+          ;(state.options as any).__ckQueue = (Array.isArray(ck.queue) ? ck.queue : []).map(String)
+          ;(state.options as any).__ckDepth =
+            ck.depth && typeof ck.depth === 'object' ? { ...ck.depth } : {}
+          ckExtraPages = (state.options as any).__ckUrls.size
+          if (ckExtraPages > 0 || kbPages.length > 0) {
+            params.emitLog(
+              'info',
+              `断点续爬：载入上次进度（已爬 ${ckExtraPages} 页 / 正文 ${kbPages.length} 段 / 图片 ${imgBudget.length} 张 / 待爬队列 ${(state.options as any).__ckQueue.length} 条），本次接着往后爬`,
+            )
+          }
+        }
+      }
+    }
+
     const model = params.createQwenChatModel(params.config, plan.extraction.vision)
     const proxyFilePath =
       String((state.options as any)?.proxyFilePath ?? params.config?.crawler?.proxyFilePath ?? '').trim() ||
       path.join(process.cwd(), 'proxies.txt')
     const proxyPool = proxyFilePath ? new ProxyPool(proxyFilePath) : null
 
-    const maxPages = Number(plan.maxPages ?? 1)
+    // 断点续爬：已爬过的页不计入本轮预算——本轮 maxPages 全部用于「新页面」
+    const maxPages = Number(plan.maxPages ?? 1) + ckExtraPages
     const maxItems = Number(plan.maxItems ?? 10)
     ;(state.options as any).__crawlMaxPages = maxPages
     if (siteCrawlPlanned(plan)) {
@@ -437,6 +521,40 @@ export async function runCrawlerWorkflow(params: {
     })()
     const visitedSet = new Set(memory.visited)
     const depthMap = memory.depth ?? (memory.depth = {})
+
+    // 断点续爬：已爬 URL 直接视为已访问；待爬队列/深度从 checkpoint 恢复（种子优先，其次上次队列）
+    const ckUrls: Set<string> = ((state.options as any).__ckUrls ??= new Set<string>())
+    const ckQueue: string[] = Array.isArray((state.options as any).__ckQueue)
+      ? (state.options as any).__ckQueue
+      : []
+    if (ckUrls.size > 0 || ckQueue.length > 0) {
+      const ckNorms = new Set<string>()
+      for (const u of ckUrls) {
+        visitedSet.add(u)
+        const n = normUrlForCk(u)
+        if (n) {
+          ckNorms.add(n)
+          visitedSet.add(n)
+        }
+        if (!memory.visited.includes(u)) memory.visited.push(u)
+      }
+      const ckDepth: Record<string, number> = (state.options as any).__ckDepth ?? {}
+      for (const [u, d] of Object.entries(ckDepth)) {
+        if (depthMap[u] == null) depthMap[u] = Number(d) || 0
+      }
+      const nextQueue: string[] = []
+      const qSeen = new Set<string>()
+      for (const q of [...memory.queue, ...ckQueue]) {
+        const n = normUrlForCk(q)
+        if (!n || qSeen.has(n) || ckNorms.has(n)) continue
+        qSeen.add(n)
+        nextQueue.push(q)
+      }
+      memory.queue = nextQueue
+      // checkpoint 队列只合并一次，避免后续每轮重复拼接
+      ;(state.options as any).__ckQueue = []
+    }
+
     const siteCrawl = Boolean(plan.siteCrawl)
     const maxDepth = Math.max(0, Math.min(5, Math.floor(Number(plan.maxDepth ?? 2) || 2)))
     const crawlHosts = (() => {
@@ -701,6 +819,8 @@ export async function runCrawlerWorkflow(params: {
         // ── 公司爬取：页面正文 + 挂载文件附件（供知识库 ingest 与文件下载功能）──
         try {
           const pageUrlKb = String(snapshot.finalUrl || url)
+          // 断点续爬：本页抓取成功即登记（即使正文过短不入 KB，也不再重爬）
+          ;((state.options as any).__ckUrls ??= new Set<string>()).add(pageUrlKb)
           const pageText = extractPageText(snapshot.html, 8000)
           const pageFlat = normalizeWhitespace(pageText)
           // 整站爬取会命中 404/空壳页：正文过短或明显是错误页时不入知识库
@@ -981,6 +1101,25 @@ export async function runCrawlerWorkflow(params: {
 
     if (cpMgr) await cpMgr.maybeSave({ task: params.task, plan, memory, items: merged, stats: hostStats })
 
+    // 断点续爬：每批页面结束即落盘（2s 防抖）——中途中断/被封/重启都能从上次进度接着爬
+    try {
+      const ckKeySave = String((state.options as any).__ckKey ?? '').trim()
+      if (ckKeySave) {
+        saveCrawlCheckpoint(ckKeySave, {
+          task: params.task,
+          company: String((state.options as any).__companyName ?? ''),
+          crawledUrls: Array.from((state.options as any).__ckUrls ?? []),
+          queue: [...memory.queue],
+          depth: { ...depthMap },
+          kbPages: Array.isArray((state.options as any).__kbPages) ? (state.options as any).__kbPages : [],
+          images: Array.isArray((state.options as any).__kbImages) ? (state.options as any).__kbImages : [],
+          attachments: Array.isArray((state.options as any).__attachments)
+            ? (state.options as any).__attachments
+            : [],
+        }, memory.done === true)
+      }
+    } catch {}
+
     return { memory, items: merged, stats: hostStats }
   }
 
@@ -1077,7 +1216,19 @@ export async function runCrawlerWorkflow(params: {
     ;(mergedOptions as any).__templateBlock = templateBlock
     params.emitLog('info', 'Planner：已注入相似抽取模板回放')
   }
-  const finalStateRaw = await graph.invoke(invokeInit)
+  // LangGraph 默认 recursionLimit=25：orchestrator 每批（maxConcurrency 个页面）循环一轮，
+  // 大预算整站爬取（几十上百页）必然撞上限自动终止。按页面预算动态放大上限（done 条件仍由爬取预算控制）。
+  const recursionLimit = (() => {
+    let budgetPages = Number(mergedOptions.maxPages ?? 10) || 10
+    try {
+      // 断点续爬恢复的已爬页数也计入循环轮次预算
+      const ck = loadCrawlCheckpoint(checkpointKeyFromSeeds([extractHttpUrl(params.task) ?? ''].filter(Boolean)))
+      if (ck) budgetPages += (Array.isArray(ck.crawledUrls) ? ck.crawledUrls.length : 0)
+    } catch {}
+    const conc = Math.max(1, Number(mergedOptions.maxConcurrency ?? 3) || 3)
+    return Math.max(60, Math.ceil(budgetPages / conc) + 60)
+  })()
+  const finalStateRaw = await graph.invoke(invokeInit, { recursionLimit })
 
   const serpContext = String((mergedOptions as any).__serpContext ?? '').trim()
   const parseSerpContextItems = (ctx: string) => {
